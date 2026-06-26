@@ -1,0 +1,8 @@
+# PAF-ModelDeepSeek — VPS API server (PublicForward/ForVPS/vps_server.py)
+# Install on the VPS in addition to (or instead of) requirements.txt.
+
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+websockets>=12.0
+pydantic>=2.6.0
+python-dotenv>=1.0.1

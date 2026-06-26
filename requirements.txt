@@ -1,0 +1,6 @@
+# PAF-ModelDeepSeek — core (standalone scraper + local worker)
+# Install Playwright browsers after pip install:  playwright install chromium
+
+playwright>=1.44.0
+websockets>=12.0
+python-dotenv>=1.0.1
