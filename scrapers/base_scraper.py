@@ -312,6 +312,26 @@ class BaseAIChatScraper(ABC):
     # ------------------------------------------------------------------ #
     # Response handling
     # ------------------------------------------------------------------ #
+    async def _count_response_elements(self) -> int:
+        """
+        Count how many assistant response elements currently exist on the page.
+
+        Called immediately BEFORE send_prompt() to snapshot the baseline in
+        CONTINUE mode. The result is passed to wait_for_response() so it can
+        anchor to the NEW response instead of re-reading an old one.
+        """
+        if self.page is None:
+            return 0
+        for sel in self._response_selectors():
+            try:
+                count = await self.page.locator(sel).count()
+                if count >= 0:
+                    log.debug("Response element baseline count: %d (selector: %s)", count, sel)
+                    return count
+            except Exception:
+                continue
+        return 0
+
     async def wait_for_response(
         self,
         response_selectors: list[str],
@@ -319,18 +339,31 @@ class BaseAIChatScraper(ABC):
         stability_secs: float,
         stability_polls: int,
         poll_interval: float,
+        initial_response_count: int = 0,
     ) -> str:
         """
         Wait until the AI response stops changing. The response is considered
         complete when its text is non-empty AND unchanged for `stability_polls`
         consecutive polls. More robust than waiting for a loading indicator.
+
+        Args:
+            initial_response_count: Number of assistant response elements that
+                existed on the page BEFORE the prompt was sent (snapshot taken
+                by _count_response_elements()). In CONTINUE mode the page
+                already has N old responses — we must wait until count > N
+                before reading, otherwise we immediately read an old stable
+                response and return it as if it were the new one.
+                Defaults to 0 (NEW mode: no prior responses on page).
         """
         deadline = time.monotonic() + timeout
         last_text = ""
         stable_count = 0
 
         while time.monotonic() < deadline:
-            text = await self._read_latest_response(response_selectors)
+            text = await self._read_latest_response(
+                response_selectors,
+                skip_count=initial_response_count,
+            )
             if text and text == last_text:
                 stable_count += 1
                 if stable_count >= stability_polls:
@@ -343,15 +376,29 @@ class BaseAIChatScraper(ABC):
         log.warning("wait_for_response timed out after %.0fs", timeout)
         return last_text
 
-    async def _read_latest_response(self, selectors: list[str]) -> str:
-        """Return the text of the latest assistant message, trying selectors."""
+    async def _read_latest_response(
+        self,
+        selectors: list[str],
+        skip_count: int = 0,
+    ) -> str:
+        """
+        Return the text of the latest assistant message, trying selectors in order.
+
+        Args:
+            skip_count: Ignore the first N elements (the pre-existing responses
+                in CONTINUE mode). Only read elements at index >= skip_count.
+                In NEW mode this is 0 so behaviour is unchanged.
+        """
         if self.page is None:
             return ""
         for sel in selectors:
             try:
                 loc = self.page.locator(sel)
                 count = await loc.count()
-                if count:
+                # Guard: only proceed if there is at least one NEW element
+                # beyond the baseline snapshot. This prevents returning a
+                # stale old response before DeepSeek begins streaming.
+                if count > skip_count:
                     text = await loc.nth(count - 1).inner_text()
                     if text and text.strip():
                         return text.strip()
@@ -536,6 +583,16 @@ class BaseAIChatScraper(ABC):
                     if not await self._rotate_account(restart_first=False):
                         raise RuntimeError("Login failed and no account to rotate")
 
+                # Snapshot response count BEFORE sending the prompt.
+                # In CONTINUE mode the page already has N old responses;
+                # wait_for_response uses this baseline to skip them and only
+                # read the NEW response once it appears.
+                initial_response_count = await self._count_response_elements()
+                log.debug(
+                    "Response baseline before send: %d element(s) on page",
+                    initial_response_count,
+                )
+
                 await self.send_prompt(prompt, mode=mode, **merged_kwargs)
 
                 t = DEEPSEEK_CONFIG["timeouts"]
@@ -545,6 +602,7 @@ class BaseAIChatScraper(ABC):
                     stability_secs=t["stability_check"],
                     stability_polls=t["stability_polls"],
                     poll_interval=t["poll_interval"],
+                    initial_response_count=initial_response_count,
                 )
 
                 if await self.is_rate_limited():

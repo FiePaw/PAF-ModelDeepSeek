@@ -64,7 +64,7 @@ curl http://16.79.2.204:9000/health
 ### 2. List Models (Available Accounts)
 **GET** `/v1/models`
 
-List all available DeepSeek accounts across all workers.
+List all available DeepSeek accounts registered across all workers.
 
 **Request:**
 ```bash
@@ -76,31 +76,16 @@ curl http://16.79.2.204:9000/v1/models
 {
   "object": "list",
   "data": [
-    {
-      "id": "account1",
-      "object": "model",
-      "created": 1719374917,
-      "owned_by": "deepseek"
-    },
-    {
-      "id": "account2",
-      "object": "model",
-      "created": 1719374917,
-      "owned_by": "deepseek"
-    },
-    {
-      "id": "account3",
-      "object": "model",
-      "created": 1719374917,
-      "owned_by": "deepseek"
-    }
+    {"id": "account1", "object": "model", "owned_by": "PAF-ai"},
+    {"id": "account2", "object": "model", "owned_by": "PAF-ai"}
   ]
 }
 ```
 
 **Notes:**
-- Each account represents a logged-in DeepSeek browser
-- The `id` field is the account name that can be used with `preferred_account`
+- Each entry represents a logged-in DeepSeek browser account registered to a worker
+- The `id` field is the account name — use it with `preferred_account` to route requests to a specific account
+- `owned_by` is always `"PAF-ai"`
 
 ---
 

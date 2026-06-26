@@ -115,13 +115,31 @@ DEEPSEEK_CONFIG: dict = {
             "div[contenteditable='true']",
         ],
         # Send button — up-arrow icon inside a circle at right of textarea.
-        # Community projects report div.ds-icon-button._7436101 with an
-        # aria-disabled attribute that gates click-readiness. The _7436101
-        # hash is MINIFIED and WILL change — keep robust fallbacks first.
-        # TODO: verify the current minified class via DevTools.
+        #
+        # Verified DOM structure (June 2026):
+        #   Parent container:  class="bf38813a"
+        #   Button element:    class="ds-button ds-button--primary ds-button--filled
+        #                             ds-button--circle ds-button--m
+        #                             ds-button--icon-relative-m _52c986b"
+        #   Inner element:     class="ds-button__background"
+        #
+        # Active   (input filled, ready to send):
+        #   → classes above WITHOUT ds-button--disabled / bd74640a
+        # Inactive (streaming / empty input):
+        #   → adds ds-button--disabled + bd74640a to the class list
+        #
+        # Selector strategy: target the ACTIVE state only (no ds-button--disabled).
+        # _52c986b and bf38813a are minified hashes — WILL change between builds.
+        # Stable anchors: ds-button--circle, ds-button--primary, ds-button--filled.
         "send_button": [
+            # Most precise: circle button inside verified container, not disabled
+            ".bf38813a .ds-button--circle.ds-button--primary:not(.ds-button--disabled)",
+            # Without container scope — still precise via circle+primary+not-disabled
+            ".ds-button--circle.ds-button--primary.ds-button--filled:not(.ds-button--disabled)",
+            # Broader fallback: any enabled circle ds-button
+            ".ds-button--circle:not(.ds-button--disabled):has(.ds-button__background)",
+            # Legacy fallbacks (pre-v2.0.3, kept for backward compat)
             'div[role="button"][aria-disabled="false"]:has(svg)',
-            "div.ds-icon-button._7436101",
             "div.ds-icon-button[aria-disabled='false']",
             'button[type="submit"]',
         ],

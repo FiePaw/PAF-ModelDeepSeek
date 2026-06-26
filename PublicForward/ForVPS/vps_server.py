@@ -457,24 +457,14 @@ async def health():
 
 @app.get("/v1/models")
 async def list_models():
-    """Feature 5: List models with live accounts from workers."""
+    """List all available accounts (models) registered across all workers."""
     accounts = worker_mgr.list_all_accounts()
-    models = [
-        {
-            "id": model_id,
-            "object": "model",
-            "created": int(time.time()),
-            "owned_by": "deepseek",
-            "permission": [],
-            "root": model_id,
-            "parent": None,
-        }
-        for model_id in MODEL_ALIASES.keys()
-    ]
     return {
         "object": "list",
-        "data": models,
-        "accounts": accounts,  # Feature 5: Show available accounts
+        "data": [
+            {"id": account_id, "object": "model", "owned_by": "PAF-ai"}
+            for account_id in accounts
+        ],
     }
 
 

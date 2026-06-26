@@ -519,13 +519,23 @@ class DeepSeekScraper(BaseAIChatScraper):
 
         if mode == "new":
             await self._goto_new_chat()
-
-        # Select mode first — this determines which tools are available.
-        await self._select_model_tab(model_tab)
-
-        # Enable tools — checked AFTER mode selection (availability differs per mode).
-        await self._set_toggle("DeepThink", _SEL["deep_think_toggle"], deep_think)
-        await self._set_toggle("Search", _SEL["web_search_toggle"], web_search)
+            # Select mode first — determines which tools are available.
+            await self._select_model_tab(model_tab)
+            # Enable tools — checked AFTER mode selection (availability differs per mode).
+            await self._set_toggle("DeepThink", _SEL["deep_think_toggle"], deep_think)
+            await self._set_toggle("Search", _SEL["web_search_toggle"], web_search)
+        else:
+            # CONTINUE mode: conversation is already in progress.
+            # DeepSeek hides the mode pills and tool toggles once a conversation
+            # has started — they are only shown on a fresh new-chat page.
+            # Attempting _select_model_tab() / _set_toggle() here would time out
+            # waiting for DOM elements that don't exist.
+            # The mode and tools were set at the start of the conversation and
+            # cannot be changed mid-thread; skip silently.
+            log.debug(
+                "CONTINUE mode: skipping mode/tool selection "
+                "(controls are hidden in an active conversation)"
+            )
 
         # Attachments (image/doc) via clipboard paste.
         if attachments:
