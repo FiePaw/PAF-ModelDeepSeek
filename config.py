@@ -163,46 +163,95 @@ DEEPSEEK_CONFIG: dict = {
             "div.ds-icon-button:has-text('New chat')",
             'a[href="/"]',
         ],
-        # ---------------- Layer 1: model tabs (Instant / Expert / Vision) -----
-        # Shown as 3 horizontal pills above the chat box before chatting.
-        # TODO: verify — these are best matched by visible text.
+        # ---------------- Layer 1: Mode selector (Instant / Expert / Vision) ---
+        # DeepSeek has 3 modes shown as horizontal pills above the chat box.
+        #
+        # Verified DOM structure (minified React classes, June 2026):
+        #   div.e362e944                              ← pill container
+        #     div._9f2341b._18572c1[._31a22b0]        ← mode pill (active gets _31a22b0)
+        #       div.dfb78875                          ← text label ("Instant"/"Expert"/"Vision")
+        #
+        # NO role="button", NO role="tab", NO "tab" substring in class names.
+        # Active pill gains extra class _31a22b0 (minified — will change between builds).
+        #
+        # Selector strategy (ordered by specificity):
+        #   1. :text-is("X")          — Playwright exact text match on the text label div.
+        #                               Only matches elements whose FULL text content equals "X".
+        #                               Will NOT match <html> or parent containers.
+        #   2. div:has-text("X"):not(:has(div)) — leaf div (no div children) containing "X".
+        #   3. div[class*="tab"]:has-text("X")  — fallback if future DOM adds "tab" in class.
+        #   4. button / role="tab"               — semantic fallbacks for future refactors.
+        #
+        # IMPORTANT: NEVER use bare ':has-text("X") >> nth=0' — it matches <html> root
+        # because <html> CONTAINS the text. The scraper then tries to click <html>
+        # which is "not visible" → timeout.
+        #
+        # NOTE: The internal parameter name is "model_tab" for backward
+        # compatibility, but user-facing terminology is "mode".
         "model_tab": {
             "instant": [
-                'div[role="button"]:has-text("Instant")',
+                ':text-is("Instant")',
+                'div:has-text("Instant"):not(:has(div))',
+                'div[class*="tab"]:has-text("Instant")',
                 'button:has-text("Instant")',
+                'div[role="tab"]:has-text("Instant")',
             ],
             "expert": [
-                'div[role="button"]:has-text("Expert")',
+                ':text-is("Expert")',
+                'div:has-text("Expert"):not(:has(div))',
+                'div[class*="tab"]:has-text("Expert")',
                 'button:has-text("Expert")',
+                'div[role="tab"]:has-text("Expert")',
             ],
             "vision": [
-                'div[role="button"]:has-text("Vision")',
+                ':text-is("Vision")',
+                'div:has-text("Vision"):not(:has(div))',
+                'div[class*="tab"]:has-text("Vision")',
                 'button:has-text("Vision")',
+                'div[role="tab"]:has-text("Vision")',
             ],
         },
-        # Marker that indicates a tab/pill is the active one (used to avoid
-        # re-clicking an already-active control). Verify the exact active class.
-        # TODO: verify
+        # Marker that indicates a mode pill is the active one.
+        # DeepSeek uses an extra minified class on the active pill (e.g. _31a22b0)
+        # which changes between builds. The hint "active" is a best-effort class
+        # fragment check. The scraper also checks aria-checked / aria-pressed /
+        # aria-selected, and has a class-count heuristic (active pill has MORE
+        # classes than inactive siblings).
         "active_marker_class_hint": "active",
+        # Additional aria attribute checked for active state (mode pill variant).
+        "active_aria_selected": "aria-selected",
 
-        # ---------------- Layer 2: toggle pills (DeepThink / Search) ----------
-        # Located below the textarea. Each is an independent on/off toggle.
-        # IMPORTANT: availability of these toggles DIFFERS per Layer-1 tab —
-        # explore each tab manually before trusting these. The scraper degrades
-        # gracefully (logs a warning) when a toggle is missing/disabled.
-        # NOTE: DeepSeek renamed "DeepThink" -> "Deep thinking" in newer builds;
-        # both labels are kept as fallbacks. The control is a .ds-toggle-button.
-        # TODO: verify current label/class via DevTools.
+        # ---------------- Layer 2: Tools (DeepThink / Search) -----------------
+        # DeepSeek has 2 tools, shown as toggle pills below the textarea.
+        # Each is an independent on/off toggle.
+        #
+        # CONFIRMED availability matrix (verified from UI + user description):
+        #   Instant mode : DeepThink ✅  Search ✅  (both tools available)
+        #   Expert mode  : DeepThink ✅  Search ❌  (Search pill absent/hidden)
+        #   Vision mode  : DeepThink ✅  Search ❌  (Search pill absent/hidden)
+        #
+        # The scraper enforces this matrix in code — it will NOT attempt to
+        # enable Search when on Expert/Vision mode (avoids the warning).
+        #
+        # Selector strategy: DeepSeek uses .ds-toggle-button for these pills.
+        # Text labels from screenshot: "DeepThink" and "Search".
+        # Broad fallbacks included for label/class drift.
         "deep_think_toggle": [
-            '.ds-toggle-button:has-text("Deep thinking")',
             '.ds-toggle-button:has-text("DeepThink")',
+            '.ds-toggle-button:has-text("Deep thinking")',
+            'div[class*="toggle"]:has-text("DeepThink")',
+            'div[class*="toggle"]:has-text("Deep thinking")',
             '[aria-label*="DeepThink" i]',
-            'div[role="button"]:has-text("Deep thinking")',
+            '[aria-label*="deep think" i]',
             'div[role="button"]:has-text("DeepThink")',
-            'div[role="button"]:has-text("R1")',
+            'div[role="button"]:has-text("Deep thinking")',
+            'button:has-text("DeepThink")',
+            'button:has-text("Deep thinking")',
         ],
         "web_search_toggle": [
             '.ds-toggle-button:has-text("Search")',
+            'div[class*="toggle"]:has-text("Search")',
+            '[aria-label*="Search" i]',
             'div[role="button"]:has-text("Search")',
             'button:has-text("Search")',
         ],
@@ -275,10 +324,14 @@ DEEPSEEK_CONFIG: dict = {
     #   requested toggle is absent/disabled for the active tab it logs a warning
     #   and continues WITHOUT crashing. Fill in the confirmed matrix below once
     #   you have explored every tab.
+    # Confirmed tool availability per mode (verified by user + UI screenshot).
+    # Keys map mode name -> which tools are present in the DOM.
+    # The scraper uses this matrix to skip tools that don't exist for the
+    # active mode, preventing false-negative warnings and unnecessary waits.
     "tab_toggle_matrix": {
-        # "instant": {"deep_think": True, "web_search": True},   # TODO verify
-        # "expert":  {"deep_think": True, "web_search": True},   # TODO verify
-        # "vision":  {"deep_think": False, "web_search": False},  # TODO verify
+        "instant": {"deep_think": True,  "web_search": True},   # both tools available
+        "expert":  {"deep_think": True,  "web_search": False},  # DeepThink only
+        "vision":  {"deep_think": True,  "web_search": False},  # DeepThink only
     },
 
     # ------------------------------------------------------------------- #

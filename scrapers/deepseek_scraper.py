@@ -7,10 +7,10 @@ IMPORTANT — DOM verification
 ----------------------------
 DeepSeek is a minified React SPA. Every selector is pulled from config and
 marked there with TODO-verify notes. The scraper is intentionally *defensive*:
-controls (model tabs, DeepThink/Search toggles) are best-effort. When a control
-is missing or disabled for the active tab, the scraper logs a warning and
-continues rather than crashing — because the available Layer-2 toggles DIFFER
-per Layer-1 tab and that matrix is not fully documented yet.
+controls (mode selector, DeepThink/Search tools) are best-effort. When a control
+is missing or disabled for the active mode, the scraper logs a warning and
+continues rather than crashing — because the available tools DIFFER per mode
+(e.g. Search is only available on Instant mode).
 """
 from __future__ import annotations
 
@@ -70,22 +70,86 @@ class DeepSeekScraper(BaseAIChatScraper):
             return False
 
     async def _is_active(self, loc) -> bool:
-        """Heuristic: is a tab/toggle currently active? Checks class + aria."""
+        """
+        Heuristic: is a mode pill / tool toggle currently active?
+
+        Checks (in order):
+          1. aria-checked / aria-pressed / aria-selected attributes
+          2. Class fragment hint (e.g. "active" substring in class)
+          3. Class-count comparison: DeepSeek's active pill gets an EXTRA
+             minified class (e.g. _31a22b0) that inactive siblings lack.
+             If the element and its sibling(s) can be compared, the one
+             with more classes is considered active.
+        """
         try:
             cls = (await loc.get_attribute("class")) or ""
-            aria = (await loc.get_attribute("aria-checked")) or ""
-            pressed = (await loc.get_attribute("aria-pressed")) or ""
+            aria_checked  = (await loc.get_attribute("aria-checked"))  or ""
+            aria_pressed  = (await loc.get_attribute("aria-pressed"))  or ""
+            aria_selected = (await loc.get_attribute("aria-selected")) or ""
             hint = DEEPSEEK_CONFIG["selectors"].get("active_marker_class_hint", "active")
-            return (
-                hint in cls.lower()
-                or aria.lower() == "true"
-                or pressed.lower() == "true"
-            )
+
+            # Check 1: ARIA state attributes
+            if (
+                aria_checked.lower()  == "true"
+                or aria_pressed.lower()  == "true"
+                or aria_selected.lower() == "true"
+            ):
+                return True
+
+            # Check 2: Class fragment hint
+            if hint and hint in cls.lower():
+                return True
+
+            return False
+        except Exception:
+            return False
+
+    async def _is_active_by_class_count(self, loc) -> bool:
+        """
+        DeepSeek-specific heuristic: the active mode pill has MORE CSS classes
+        than its inactive siblings (e.g. active pill has 3 classes, inactive
+        has 2). Compare the target element's class count against its siblings.
+
+        Returns True if the element has strictly more classes than at least one
+        sibling. Returns False if comparison is impossible (no siblings, no
+        class, or any exception).
+        """
+        try:
+            cls = (await loc.get_attribute("class")) or ""
+            my_count = len(cls.split())
+            if my_count == 0:
+                return False
+
+            # Navigate to parent, then check sibling class counts.
+            parent = loc.locator('..')
+            if await parent.count() == 0:
+                return False
+
+            siblings = parent.first.locator('> *')
+            sib_count = await siblings.count()
+            if sib_count < 2:
+                return False  # no siblings to compare
+
+            min_sib_classes = my_count  # start with own count
+            for i in range(sib_count):
+                sib = siblings.nth(i)
+                sib_cls = (await sib.get_attribute("class")) or ""
+                sib_len = len(sib_cls.split())
+                if sib_len > 0 and sib_len < min_sib_classes:
+                    min_sib_classes = sib_len
+
+            if my_count > min_sib_classes:
+                log.debug(
+                    "Active by class-count heuristic: %d classes vs sibling min %d",
+                    my_count, min_sib_classes,
+                )
+                return True
+            return False
         except Exception:
             return False
 
     # ------------------------------------------------------------------ #
-    # Layer 1 — model tabs (Instant / Expert / Vision)
+    # Layer 1 — Mode selector (Instant / Expert / Vision)
     # ------------------------------------------------------------------ #
     async def _select_model_tab(self, model_tab: str) -> None:
         model_tab = (model_tab or DEEPSEEK_CONFIG["default_model_tab"]).lower()
@@ -94,44 +158,137 @@ class DeepSeekScraper(BaseAIChatScraper):
             log.warning("Unknown model_tab '%s'; staying on current tab", model_tab)
             return
 
+        # --- Attempt 1: use configured selectors (fast path) -----------------
         loc = await self._find_first(tab_selectors, timeout_ms=3000)
+
+        # --- Attempt 2: text-content scan fallback ---------------------------
+        # DeepSeek mode pills are plain divs whose only stable attribute is
+        # their visible text. The text label is a CHILD div inside the clickable
+        # pill parent. We find the text label, then navigate UP to the parent
+        # pill (the clickable element that carries the active class).
+        if loc is None and self.page is not None:
+            label = model_tab.capitalize()  # "Instant" | "Expert" | "Vision"
+            try:
+                candidates = self.page.get_by_text(label, exact=True)
+                count = await candidates.count()
+                if count > 0:
+                    text_el = candidates.first
+                    # Try to click the PARENT of the text label (the pill div),
+                    # because the click handler is typically on the pill, not the
+                    # text child. Use locator('..') to go up one level.
+                    parent = text_el.locator('..')
+                    parent_count = await parent.count()
+                    if parent_count > 0:
+                        loc = parent.first
+                        log.debug(
+                            "Mode '%s' found via get_by_text→parent fallback "
+                            "(%d text match(es))",
+                            model_tab, count,
+                        )
+                    else:
+                        loc = text_el
+                        log.debug(
+                            "Mode '%s' found via get_by_text fallback (no parent) "
+                            "(%d text match(es))",
+                            model_tab, count,
+                        )
+            except Exception as exc:  # noqa: BLE001
+                log.debug("get_by_text fallback failed for mode '%s': %s", model_tab, exc)
+
         if loc is None:
             log.warning(
-                "Model tab '%s' not found in DOM — UI may differ. "
-                "Continuing without switching tabs. (TODO: verify selectors)",
+                "Mode '%s' not found in DOM after selector + text-scan fallback. "
+                "Continuing on current mode. "
+                "(Hint: open DevTools on chat.deepseek.com and inspect the mode pills "
+                "to update config.py selectors[model_tab])",
                 model_tab,
             )
             return
 
-        if await self._is_active(loc):
-            log.info("Model tab '%s' already active", model_tab)
+        # Detect whether the located pill is already the active mode.
+        # DeepSeek marks the active pill with an extra minified class (e.g.
+        # _31a22b0). Since the class name changes between builds, we compare
+        # class count: the active pill has MORE classes than inactive siblings.
+        already_active = await self._is_active(loc)
+        if not already_active:
+            already_active = await self._is_active_by_class_count(loc)
+
+        if already_active:
+            log.info("Mode '%s' already active", model_tab)
         else:
             try:
                 await loc.click(timeout=3000)
                 await asyncio.sleep(_T["between_actions"])
-                log.info("Selected model tab '%s'", model_tab)
+                log.info("Selected mode '%s'", model_tab)
             except Exception as exc:  # noqa: BLE001
-                log.warning("Could not click model tab '%s': %s", model_tab, exc)
+                log.warning("Could not select mode '%s': %s", model_tab, exc)
                 return
         self._active_model_tab = model_tab
 
     # ------------------------------------------------------------------ #
-    # Layer 2 — DeepThink / Search toggles (availability differs per tab!)
+    # Layer 2 — Tools: DeepThink / Search (availability differs per mode!)
     # ------------------------------------------------------------------ #
+
+    # Internal mapping: tool name (lowercased) -> matrix key in config.
+    _TOOL_MATRIX_KEY: dict[str, str] = {
+        "deepthink": "deep_think",
+        "deep thinking": "deep_think",
+        "search": "web_search",
+    }
+
+    def _tool_allowed_for_mode(self, name: str) -> bool:
+        """
+        Check the confirmed tab_toggle_matrix in config to decide whether the
+        requested tool is available on the currently-active mode.
+
+        Returns True  → proceed (tool exists for this mode).
+        Returns False → skip silently (tool is NOT present for this mode).
+
+        If the matrix has no entry for the active mode (e.g. a future mode), we
+        default to True so the scraper still *tries* rather than silently skips.
+        """
+        matrix = DEEPSEEK_CONFIG.get("tab_toggle_matrix", {})
+        mode_entry = matrix.get(self._active_model_tab)
+        if mode_entry is None:
+            # Unknown mode — don't block, let the DOM check decide.
+            return True
+        matrix_key = self._TOOL_MATRIX_KEY.get(name.lower())
+        if matrix_key is None:
+            # Unknown tool name — don't block.
+            return True
+        return bool(mode_entry.get(matrix_key, False))
+
     async def _set_toggle(self, name: str, selectors: list[str], desired: bool) -> None:
         """
-        Defensively set a Layer-2 toggle. If the toggle is absent or disabled in
-        the currently-active model tab, log a warning and continue (do NOT crash).
+        Defensively enable a DeepSeek tool (DeepThink or Search). If the tool
+        is absent or disabled in the currently-active mode, log accordingly
+        and continue (do NOT crash).
+
+        Matrix pre-check: before touching the DOM, consult tab_toggle_matrix to
+        see if the tool is even supposed to exist on this mode. If not, skip
+        silently (no warning — it's expected behaviour, not an error).
         """
         if not desired:
             return  # only act when caller wants it ON; default state is OFF
 
+        # --- Pre-check: is this tool available on the active mode? ------------
+        if not self._tool_allowed_for_mode(name):
+            log.debug(
+                "'%s' tool is not available on mode '%s' (confirmed by matrix) — "
+                "skipping silently.",
+                name, self._active_model_tab,
+            )
+            return
+
         loc = await self._find_first(selectors, timeout_ms=2500)
         if loc is None:
+            # Tool should be present (matrix says so) but wasn't found —
+            # this is a genuine selector mismatch worth warning about.
             log.warning(
-                "'%s' toggle not available for tab '%s' — skipping "
-                "(Layer-2 options differ per Layer-1 tab; TODO: verify matrix).",
-                name, self._active_model_tab,
+                "'%s' tool not found in DOM for mode '%s'. "
+                "Selector may need updating — check config.py selectors. "
+                "Continuing without enabling '%s'.",
+                name, self._active_model_tab, name,
             )
             return
 
@@ -140,7 +297,7 @@ class DeepSeekScraper(BaseAIChatScraper):
             disabled = (await loc.get_attribute("aria-disabled")) or ""
             if disabled.lower() == "true" or not await loc.is_enabled():
                 log.warning(
-                    "'%s' toggle is disabled for tab '%s' — skipping.",
+                    "'%s' tool is disabled for mode '%s' — skipping.",
                     name, self._active_model_tab,
                 )
                 return
@@ -153,9 +310,9 @@ class DeepSeekScraper(BaseAIChatScraper):
         try:
             await loc.click(timeout=2500)
             await asyncio.sleep(_T["between_actions"])
-            log.info("Enabled '%s' toggle", name)
+            log.info("Enabled '%s' tool", name)
         except Exception as exc:  # noqa: BLE001
-            log.warning("Could not toggle '%s': %s", name, exc)
+            log.warning("Could not enable '%s' tool: %s", name, exc)
 
     # ------------------------------------------------------------------ #
     # Navigation
@@ -353,8 +510,8 @@ class DeepSeekScraper(BaseAIChatScraper):
         """
         Send a prompt to DeepSeek.
 
-        Order: (new -> open new chat) -> select model tab (Layer 1) ->
-        re-check + set Layer-2 toggles -> attach files -> type prompt -> send.
+        Order: (new -> open new chat) -> select mode (Instant/Expert/Vision) ->
+        enable tools (DeepThink/Search) -> attach files -> type prompt -> send.
         Returns a handle string (here, the active response selector) for
         wait_for_response.
         """
@@ -363,10 +520,10 @@ class DeepSeekScraper(BaseAIChatScraper):
         if mode == "new":
             await self._goto_new_chat()
 
-        # Layer 1 first — this can change which Layer-2 controls exist.
+        # Select mode first — this determines which tools are available.
         await self._select_model_tab(model_tab)
 
-        # Layer 2 — re-checked AFTER tab selection, defensively.
+        # Enable tools — checked AFTER mode selection (availability differs per mode).
         await self._set_toggle("DeepThink", _SEL["deep_think_toggle"], deep_think)
         await self._set_toggle("Search", _SEL["web_search_toggle"], web_search)
 

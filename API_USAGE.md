@@ -157,13 +157,26 @@ curl -X POST http://16.79.2.204:9000/v1/chat/completions \
 
 Simplify mode selection with these aliases:
 
-| think_mode | → model_tab | → deep_think | → search |
-|------------|-------------|--------------|----------|
-| `"instant"` | `"instant"` | `false` | `false` |
-| `"thinking"` | `"expert"` | `true` | `false` |
-| `"deep"` | `"expert"` | `true` | `false` |
-| `"search"` | `"expert"` | `false` | `true` |
-| `"vision"` | `"vision"` | `false` | `false` |
+| think_mode | → model_tab | → deep_think | → search | Notes |
+|------------|-------------|--------------|----------|-------|
+| `"instant"` | `"instant"` | `false` | `false` | Default mode |
+| `"thinking"` | `"instant"` | `true` | `false` | DeepThink on Instant tab |
+| `"deep"` | `"instant"` | `true` | `false` | Alias for `"thinking"` |
+| `"search"` | `"instant"` | `false` | `true` | Search only on Instant tab |
+| `"expert"` | `"expert"` | `true` | `false` | Expert tab + DeepThink |
+| `"vision"` | `"vision"` | `false` | `false` | Vision/OCR tab |
+
+> **Important — Toggle Availability per Tab:**
+> DeepSeek enforces which toggles are available depending on the active tab:
+>
+> | Tab | DeepThink | Search |
+> |-----|-----------|--------|
+> | `instant` | ✅ Available | ✅ Available |
+> | `expert` | ✅ Available | ❌ Not available (pill hidden) |
+> | `vision` | ✅ Available | ❌ Not available (pill hidden) |
+>
+> The scraper enforces this matrix automatically — requesting `search: true` on
+> the `expert` or `vision` tab is silently ignored (no error, no warning).
 
 **Example with think_mode:**
 ```bash
@@ -368,9 +381,30 @@ curl -X POST http://16.79.2.204:9000/v1/chat/completions \
 ```
 
 **Behavior:**
-- Uses Expert tab with DeepThink enabled
+- Uses Instant tab with DeepThink enabled
 - DeepSeek will show its reasoning process
 - Response includes full reasoning + answer
+
+---
+
+### Example 4b: Expert Mode (DeepThink on Expert tab)
+
+```bash
+curl -X POST http://16.79.2.204:9000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-chat",
+    "messages": [
+      {"role": "user", "content": "Analyze this algorithm complexity"}
+    ],
+    "think_mode": "expert"
+  }'
+```
+
+**Behavior:**
+- Uses Expert tab with DeepThink enabled
+- Search is **not available** on Expert tab — will be ignored even if set to `true`
+- Best for complex reasoning tasks without web access
 
 ---
 
@@ -627,6 +661,13 @@ curl -X POST http://16.79.2.204:9000/v1/chat/completions \
 - DeepThink mode takes longer (10-30 seconds)
 - Vision mode with images takes 5-15 seconds
 
+### 6. Tab & Toggle Constraints
+- **Instant tab**: Both DeepThink and Search toggles are available
+- **Expert tab**: Only DeepThink is available — Search is not shown in the UI
+- **Vision tab**: Only DeepThink is available — Search is not shown in the UI
+- Setting `"search": true` with `model_tab: "expert"` or `"vision"` is safe —
+  the scraper silently ignores it (no error returned)
+
 ### 5. Rate Limits
 - DeepSeek enforces per-account rate limits
 - Use multiple accounts to increase throughput
@@ -722,6 +763,6 @@ For issues or questions:
 
 ---
 
-**Version**: 2.0.2  
+**Version**: 2.0.3  
 **Last Updated**: June 26, 2026  
 **Base URL**: http://16.79.2.204:9000
