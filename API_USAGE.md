@@ -157,26 +157,29 @@ curl -X POST http://16.79.2.204:9000/v1/chat/completions \
 
 Simplify mode selection with these aliases:
 
-| think_mode | → model_tab | → deep_think | → search | Notes |
-|------------|-------------|--------------|----------|-------|
-| `"instant"` | `"instant"` | `false` | `false` | Default mode |
-| `"thinking"` | `"instant"` | `true` | `false` | DeepThink on Instant tab |
-| `"deep"` | `"instant"` | `true` | `false` | Alias for `"thinking"` |
-| `"search"` | `"instant"` | `false` | `true` | Search only on Instant tab |
-| `"expert"` | `"expert"` | `true` | `false` | Expert tab + DeepThink |
-| `"vision"` | `"vision"` | `false` | `false` | Vision/OCR tab |
+| think_mode | → Mode | → DeepThink | → Search | Notes |
+|------------|--------|-------------|----------|-------|
+| `"instant"` / `"fast"` | Instant | `false` | `false` | Default mode, fastest response |
+| `"thinking"` / `"deep"` | Expert | `true` | `false` | Expert mode + DeepThink tool |
+| `"expert"` / `"reasoning"` | Expert | `true` | `false` | Alias for `"thinking"` |
+| `"search"` | Instant | `false` | `true` | Instant mode + Search tool |
+| `"vision"` | Vision | `false` | `false` | Vision/OCR mode |
 
-> **Important — Toggle Availability per Tab:**
-> DeepSeek enforces which toggles are available depending on the active tab:
+> **Important — Tool Availability per Mode:**
+> DeepSeek enforces which tools are available depending on the active mode:
 >
-> | Tab | DeepThink | Search |
-> |-----|-----------|--------|
-> | `instant` | ✅ Available | ✅ Available |
-> | `expert` | ✅ Available | ❌ Not available (pill hidden) |
-> | `vision` | ✅ Available | ❌ Not available (pill hidden) |
+> | Mode | DeepThink | Search |
+> |------|-----------|--------|
+> | Instant | ✅ Available | ✅ Available |
+> | Expert | ✅ Available | ❌ Not available (hidden in UI) |
+> | Vision | ✅ Available | ❌ Not available (hidden in UI) |
 >
 > The scraper enforces this matrix automatically — requesting `search: true` on
-> the `expert` or `vision` tab is silently ignored (no error, no warning).
+> Expert or Vision mode is silently ignored (no error, no warning).
+> 
+> **Why `"search"` maps to Instant mode:** The Search tool is only available
+> on Instant mode. Using `"search"` alias automatically selects Instant to
+> ensure the Search tool can be activated.
 
 **Example with think_mode:**
 ```bash
@@ -366,7 +369,7 @@ curl -X POST http://16.79.2.204:9000/v1/chat/completions \
 
 ---
 
-### Example 4: Deep Thinking Mode
+### Example 4: Deep Thinking Mode (Expert)
 
 ```bash
 curl -X POST http://16.79.2.204:9000/v1/chat/completions \
@@ -381,13 +384,14 @@ curl -X POST http://16.79.2.204:9000/v1/chat/completions \
 ```
 
 **Behavior:**
-- Uses Instant tab with DeepThink enabled
+- Switches to **Expert** mode with **DeepThink** tool enabled
 - DeepSeek will show its reasoning process
+- Search tool is **not available** on Expert mode — silently ignored even if set
 - Response includes full reasoning + answer
 
 ---
 
-### Example 4b: Expert Mode (DeepThink on Expert tab)
+### Example 4b: Search Mode (Instant + Search)
 
 ```bash
 curl -X POST http://16.79.2.204:9000/v1/chat/completions \
@@ -395,16 +399,16 @@ curl -X POST http://16.79.2.204:9000/v1/chat/completions \
   -d '{
     "model": "deepseek-chat",
     "messages": [
-      {"role": "user", "content": "Analyze this algorithm complexity"}
+      {"role": "user", "content": "What are today's latest AI news?"}
     ],
-    "think_mode": "expert"
+    "think_mode": "search"
   }'
 ```
 
 **Behavior:**
-- Uses Expert tab with DeepThink enabled
-- Search is **not available** on Expert tab — will be ignored even if set to `true`
-- Best for complex reasoning tasks without web access
+- Uses **Instant** mode with **Search** tool enabled
+- DeepSeek accesses the internet for up-to-date information
+- Search tool is **only available** on Instant mode, so the alias auto-selects it
 
 ---
 
@@ -661,10 +665,10 @@ curl -X POST http://16.79.2.204:9000/v1/chat/completions \
 - DeepThink mode takes longer (10-30 seconds)
 - Vision mode with images takes 5-15 seconds
 
-### 6. Tab & Toggle Constraints
-- **Instant tab**: Both DeepThink and Search toggles are available
-- **Expert tab**: Only DeepThink is available — Search is not shown in the UI
-- **Vision tab**: Only DeepThink is available — Search is not shown in the UI
+### 6. Mode & Tool Constraints
+- **Instant mode**: Both tools available — DeepThink and Search
+- **Expert mode**: Only DeepThink tool available — Search is hidden in UI
+- **Vision mode**: Only DeepThink tool available — Search is hidden in UI
 - Setting `"search": true` with `model_tab: "expert"` or `"vision"` is safe —
   the scraper silently ignores it (no error returned)
 
