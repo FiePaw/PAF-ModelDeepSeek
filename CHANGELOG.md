@@ -5,331 +5,63 @@ Format: `[version] YYYY-MM-DD — summary`
 
 ---
 
-## [2.1.3] 2026-06-27 — Fix CONTINUE mode blank response: virtual list, selector, dan timing
-
-Tiga bug berlapis yang menyebabkan `response_chars=0` pada semua CONTINUE mode
-request meskipun DeepSeek sudah menampilkan response di browser.
-
----
-
-### Bug Fixes
-
-#### Bug #5 — `_is_stop_button_present` tidak pernah return `True` → Phase 1 selalu hangfire 15 detik (`scrapers/base_scraper.py`)
-
-**Root cause:**
-
-Dua selector teratas bergantung pada `:has(svg[class*='stop'])`:
-
-```python
-".ds-button--circle.ds-button--primary:not(.ds-button--disabled):has(svg[class*='stop'])",
-".ds-button--circle:has(svg[class*='stop'])",
-```
-
-`:has()` tidak didukung oleh `querySelectorAll` dan DeepSeek menggunakan icon
-library dengan class minified (`_abc123`, bukan `stop`). Selector ini tidak
-pernah match → `stop_seen` selalu `False` → scraper menunggu penuh **15 detik
-grace window** di setiap request sebelum masuk Phase 2.
-
-**Fix (`scrapers/base_scraper.py`):**
-
-`_is_stop_button_present()` diimplementasi ulang menggunakan `page.evaluate()`
-(satu JS round-trip, identik dengan pendekatan PAF-ModelQwen) dengan strategi
-selector berlapis di dalam JS:
-
-1. `.ds-button--circle.ds-button--primary:not(.ds-button--disabled)` + cek
-   `offsetParent !== null` — tanpa `:has()`, manual visibility check
-2. `[aria-label*="stop"]` — case-insensitive, fallback berbasis atribut
-3. `[class*="stop-btn"]`, `[class*="stopBtn"]` — fragment class
-4. `[class*="streaming"]`, `[class*="typing"]`, `.result-streaming` — indikator
-   streaming sebagai fallback terakhir
-
-Menggantikan loop 8 Playwright locator (8 CDP round-trips) dengan 1 JS call.
-
----
-
-#### Bug #6 — Selector `ds-markdown` match elemen thinking, bukan response (`config.py`)
-
-**Root cause:**
-
-Semua selector `assistant_message` dan `response_container` hanya menarget
-`div.ds-markdown`. DeepSeek menggunakan class yang sama untuk **dua jenis
-elemen berbeda**:
-
-| Elemen | Class aktual | Isi |
-|--------|-------------|-----|
-| Reasoning / chain-of-thought | `ds-markdown` (saja) | Internal thinking process |
-| Response user-facing | `ds-markdown ds-assistant-message-main-content` | Teks yang harus dikembalikan |
-
-Akibatnya `_read_latest_response()` kadang membaca thinking block DeepSeek,
-bukan response sesungguhnya. Atau count elemen jadi inflated sehingga
-`skip_count` salah.
-
-**Dikonfirmasi dari DOM debug log (27 Juni 2026):**
-
-```
-cls='ds-markdown' role='' | 'The user said "curhat mungkin?" ...'  ← thinking block
-cls='ds-markdown ds-assistant-message-main-content' | 'Siap, silakan curhat aja...'  ← response asli
-```
-
-**Fix (`config.py`):**
-
-Selector diperbarui dengan `ds-assistant-message-main-content` sebagai
-discriminator utama:
-
-```python
-"assistant_message": [
-    "div.ds-assistant-message-main-content",
-    "div.ds-markdown.ds-assistant-message-main-content",
-    "div[class*='ds-assistant-message-main-content']",
-    "div.ds-markdown",              # fallback lebar
-    "div[class*='ds-markdown']",
-],
-"response_container": [
-    "div.ds-assistant-message-main-content",
-    "div.ds-markdown.ds-assistant-message-main-content",
-    "div[class*='ds-assistant-message-main-content']",
-    "div.ds-markdown",
-    "div[class*='ds-markdown']",
-],
-```
-
-Semua selector `:last-of-type` dihapus — lihat Bug #7.
-
----
-
-#### Bug #7 — Virtual list + `:last-of-type` + `skip_count` count-based → response tidak pernah terbaca (`scrapers/base_scraper.py`)
-
-**Root cause (tiga komponen):**
-
-**7a — `:last-of-type` selalu return `count=1`:**
-
-CSS pseudo-class `:last-of-type` diproses oleh browser sebelum Playwright
-memfilter — browser hanya mengembalikan satu elemen (yang terakhir). Playwright
-`locator.count()` pada selector `:last-of-type` selalu = `1` regardless berapa
-banyak elemen yang sebenarnya ada di DOM.
-
-Di CONTINUE mode: `initial_response_count = 1` (baseline), saat polling
-`count = 1` juga → `count > skip_count` = `1 > 1` = `False` → tidak pernah
-membaca apapun → timeout 300 detik.
-
-**7b — DeepSeek Virtual List:**
-
-DeepSeek merender percakapan menggunakan `ds-virtual-list` — hanya pesan yang
-visible di **viewport** yang exist di DOM. Artinya:
-
-- `locator.count()` berfluktuasi tergantung scroll position
-- Baseline `count` yang diambil sebelum `send_prompt()` bisa berbeda dari count
-  saat polling (virtual list bisa re-render subset berbeda)
-- Pendekatan `skip_count` integer pada dasarnya tidak reliable untuk virtual list
-
-**7c — `count` baseline tidak akurat dari `_count_response_elements()`:**
-
-`_count_response_elements()` memanggil `locator.count()` dengan selector yang
-mengandung `:last-of-type` → selalu return 1. Baseline salah sejak awal.
-
-**Root cause flow:**
-```
-NEW mode:   skip_count=0,  count=1  → 1 > 0 → OK ✅
-CONTINUE:   skip_count=1,  count=1  → 1 > 1 → False → tidak baca ❌
-```
-
-**Fix (`scrapers/base_scraper.py`):**
-
-Strategi skip_count berbasis integer diganti sepenuhnya dengan **text anchor**:
-
-1. **`_snapshot_baseline_text()`** (method baru) — dipanggil sebelum
-   `send_prompt()`, menyimpan teks response terakhir yang visible ke
-   `self._baseline_response_text` via `page.evaluate()`.
-
-2. **`_read_latest_response()`** diimplementasi ulang dengan `page.evaluate()`:
-   - Mencari elemen terakhir (`querySelectorAll` → `els[els.length - 1]`)
-   - Jika `skip_count > 0` (CONTINUE mode): bandingkan teks dengan
-     `_baseline_response_text`; jika sama → response baru belum muncul,
-     return `""` → lanjut polling
-   - Jika berbeda → response baru sudah ada, return teks tersebut
-
-3. **`_count_response_elements()`** diimplementasi ulang dengan
-   `page.evaluate()` (tidak pakai Playwright locator) agar count akurat
-   terlepas dari virtual list viewport.
-
-```python
-# Sebelum (broken):
-# 1. _count_response_elements() → locator(":last-of-type").count() → selalu 1
-# 2. skip_count = 1
-# 3. Polling: locator.count() = 1 → 1 > 1 = False → tidak baca → timeout
-
-# Sesudah (fix):
-# 1. _snapshot_baseline_text() → page.evaluate() → simpan teks response terakhir
-# 2. Polling: page.evaluate() → ambil teks elemen terakhir
-# 3. Jika teks == baseline → return "" (belum ada response baru)
-# 4. Jika teks != baseline → return teks (response baru ✅)
-```
-
-**Fix tambahan — `wait_for_response()` timeout fallback:**
-
-Phase 2 kini melacak `best_text` (teks non-empty terakhir yang berhasil dibaca).
-Saat timeout, `best_text` dikembalikan alih-alih `last_text` yang bisa kosong.
-Safety net jika response sudah ada tapi tidak sempat mencapai stability threshold.
-
-**Fix tambahan — `scrape_with_tool_result()` (`scrapers/deepseek_scraper.py`):**
-
-Sama dengan `scrape()`: tambah `await self._snapshot_baseline_text()` sebelum
-`send_prompt()` untuk menjamin text anchor terset di Turn 2 juga.
-
----
-
-### Performance
-
-#### `poll_interval` dan `stability_polls` diturunkan (`config.py`)
-
-Setelah stop button detection diperbaiki (Bug #5), polling lebih jarang
-menghabiskan full grace window. Nilai disesuaikan agar lebih responsif:
-
-| Parameter | Sebelum | Sesudah |
-|-----------|---------|---------|
-| `poll_interval` | 0.8s | 0.5s |
-| `stability_polls` | 4 | 2 |
-| Phase 2 minimum | 3.2s | 1.0s |
-
----
-
-### Diagnostics
-
-#### `_dump_dom_debug()` — DOM introspection saat timeout (`scrapers/base_scraper.py`)
-
-Method baru dipanggil otomatis saat `wait_for_response` timeout. Mengeluarkan
-log `WARNING` berisi class, id, data-role, dan preview teks semua `div` dengan
-konten bermakna (20–500 karakter). Digunakan untuk mengidentifikasi selector
-yang tepat tanpa perlu buka DevTools secara manual.
-
-Berguna untuk mendeteksi selector drift saat DeepSeek melakukan build update.
-
-#### Timing log di `_read_latest_response()` (`scrapers/base_scraper.py`)
-
-`log.debug` ditambahkan untuk setiap selector yang dicoba, menampilkan:
-`sel`, `base_sel`, `count`, `skip_count`. Aktif pada log level `DEBUG`.
-
----
-
-### Timing Log (dari sesi sebelumnya, v2.1.2)
-
-Catatan: timing log di bawah ini diimplementasi pada sesi v2.1.2 (dalam sesi
-yang sama dengan rilis ini) sebelum bug-bug di atas ditemukan:
-
-- **`public.py` — `_handle_task()`**: log `TASK RECEIVED` (prompt preview,
-  mode, session) dan `TASK DONE` / `TASK FAILED` / `TASK ERROR` dengan
-  durasi `total` dan `scrape` dalam detik.
-- **`browser_pool.py` — `run_task()` dan `run_task_with_tool_result()`**:
-  log `run_task done` dengan breakdown `acquire` (waktu tunggu slot) vs
-  `scrape` (waktu eksekusi browser) vs `total`.
-- **`browser_pool.py`**: tambah `import time`.
-- **`_execute_task()` di `public.py`**: `log.debug` dengan `elapsed` setelah
-  `pool.run_task()` selesai.
-
----
-
-### Files Changed
-
-| File | Perubahan |
-|------|-----------|
-| `config.py` | `assistant_message` + `response_container`: selector diperbarui ke `ds-assistant-message-main-content`; hapus semua `:last-of-type`; turunkan `poll_interval` 0.8→0.5, `stability_polls` 4→2 |
-| `scrapers/base_scraper.py` | `_is_stop_button_present()`: implementasi ulang dengan `page.evaluate()`; `_count_response_elements()`: implementasi ulang dengan JS; `_snapshot_baseline_text()`: method baru; `_read_latest_response()`: implementasi ulang dengan JS + text anchor; `wait_for_response()`: tambah `best_text` fallback + panggil `_dump_dom_debug()` saat timeout; `_dump_dom_debug()`: method baru |
-| `scrapers/deepseek_scraper.py` | `scrape_with_tool_result()`: tambah `_snapshot_baseline_text()` sebelum send |
-| `public.py` | `_handle_task()`: timing log `TASK RECEIVED/DONE/FAILED/ERROR`; `_execute_task()`: timing log elapsed |
-| `browser_pool.py` | `import time`; `run_task()` + `run_task_with_tool_result()`: timing log `acquire/scrape/total` |
-| `CHANGELOG.md` | Entri ini |
-
----
-
-### Version comparison (penambahan dari v2.1.2)
-
-| Feature | v2.1.2 | v2.1.3 |
-|---------|--------|--------|
-| Stop button detection | Selector `:has(svg[class*='stop'])` (tidak pernah match) | JS evaluate, tanpa `:has()`, + streaming indicator fallback |
-| Phase 1 grace window hangfire | ❌ Selalu 15 detik per request | ✅ Stop button terdeteksi → Phase 1 aktif |
-| Response selector | `div.ds-markdown` (match thinking + response) | `div.ds-assistant-message-main-content` (response saja) |
-| CONTINUE response blank | ❌ `response_chars=0` → timeout 300s | ✅ Text anchor — baca response baru segera |
-| `:last-of-type` count bug | ❌ `count` selalu 1 | ✅ Dihapus, diganti JS evaluate |
-| Virtual list compatibility | ❌ `skip_count` integer tidak reliable | ✅ Text anchor immune terhadap virtual list |
-| `_read_latest_response` | Playwright locator loop | `page.evaluate()` single round-trip |
-| `_count_response_elements` | Playwright locator + `:last-of-type` | `page.evaluate()` |
-| Timeout fallback | Return `last_text` (bisa kosong) | Return `best_text` (teks non-empty terakhir) |
-| DOM debug on timeout | ❌ | ✅ `_dump_dom_debug()` otomatis |
-| Timing log worker | ❌ | ✅ `TASK RECEIVED/DONE/FAILED/ERROR` + durasi |
-| Timing log pool | ❌ | ✅ `acquire/scrape/total` per task |
-| `poll_interval` | 0.8s | 0.5s |
-| `stability_polls` | 4 | 2 |
-
-
----
-
-
----
-
-## [2.1.1] 2026-06-27 — Optimisasi performa: input fill & auth cache
-
-Dua optimisasi performa ringan yang tidak mengubah perilaku fungsional.
-
----
-
-### Performance
-
-#### `send_prompt()` — ganti `type()` dengan `fill()` (`scrapers/deepseek_scraper.py`)
-
-`input_loc.type(prompt, delay=15)` mengetik karakter satu per satu dengan jeda
-15ms per karakter untuk terlihat "human". Untuk prompt 200 karakter, ini
-memakan **~3 detik** hanya pada tahap input.
-
-Diganti dengan `input_loc.fill(prompt)` yang men-set value sekaligus, diikuti
-satu `asyncio.sleep` pendek (`fill_settle_ms`) agar React SPA sempat meregistrasi
-input event sebelum tombol send diklik.
-
-```python
-# Sebelum (~3s untuk prompt 200 char):
-await input_loc.fill("")
-await input_loc.type(prompt, delay=15)
-await asyncio.sleep(0.4)
-
-# Sesudah (~0.12s flat):
-await input_loc.fill(prompt)
-await asyncio.sleep(BROWSER_CONFIG.get("fill_settle_ms", 120) / 1000)
-```
-
-Konfigurasi `fill_settle_ms` (default: `120`) tersedia di `BROWSER_CONFIG`
-pada `config.py` untuk penyesuaian jika SPA butuh waktu lebih lama.
-
-#### `ensure_authenticated()` — auth cache per-session (`scrapers/deepseek_scraper.py`)
-
-Sebelumnya `ensure_authenticated()` selalu memanggil `is_session_expired()` di
-setiap `scrape()` — artinya setiap request melakukan DOM query (cek URL, cek
-`input[type="password"]`, cek `query_selector` chat input, bahkan `inner_text("body")`
-sebagai last resort). Ini overhead yang sia-sia karena session hampir tidak pernah
-expired di tengah-tengah penggunaan normal.
-
-Kini `ensure_authenticated()` mempunyai fast path: jika `_authenticated=True`
-**dan** browser masih berada di domain DeepSeek, langsung return `True` tanpa
-menyentuh DOM sama sekali.
-
-```python
-# Fast path (hampir selalu diambil setelah request pertama):
-if self._authenticated:
-    if DEEPSEEK_CONFIG["base_url"] in self.page.url:
-        return True   # skip seluruh DOM check
-```
-
-Cache ter-invalidasi otomatis pada tiga kondisi yang sudah ada:
-- `restart_browser()` → `_authenticated = False`
-- `_rotate_account()` → `_authenticated = False`
-- URL drift ke luar domain DeepSeek → fallback ke full DOM check
-
----
-
-### Config
-
-#### `config.py` — `BROWSER_CONFIG`
-
-- Tambah `fill_settle_ms: 120` — durasi sleep (ms) setelah `fill()` sebelum klik send.
-- `type_delay_ms` dipertahankan sebagai referensi tapi tidak lagi dipakai oleh scraper.
+## [2.2.0] 2026-06-27 — Performance optimisation + per-stage timing instrumentation
+
+Rilis ini fokus pada **kecepatan per-proses**. Sebelumnya satu proses bisa
+memakan >30 detik dengan banyak waktu mati (dead time) yang tidak berasal dari
+kecepatan model itu sendiri, melainkan dari timeout berlebih, jeda UI, dan
+ekor stabilitas yang panjang. Selain optimasi, ditambahkan instrumentasi
+timing sehingga bagian yang lambat bisa **diukur**, bukan ditebak.
+
+Tidak ada perubahan perilaku fungsional (mode, tools, session, CONTINUE tetap
+sama) — hanya penghematan latensi dan logging baru.
+
+### Performance Optimisations
+
+#### `scrapers/deepseek_scraper.py` — `_find_first()` two-phase lookup
+- **Bug latensi tersembunyi diperbaiki.** Sebelumnya `_find_first` menunggu
+  timeout PENUH untuk SETIAP selector dalam daftar. Daftar berisi N selector
+  yang tidak ada di DOM = `timeout × N` (mis. 3 selector × 2500ms = **7.5s
+  terbuang**).
+- Sekarang dua fase: **(1)** cek keberadaan instan tanpa menunggu (kasus umum
+  langsung kembali tanpa biaya timeout), **(2)** jika tidak ketemu, budget
+  timeout **dibagi rata** lintas selector sehingga total tunggu tidak pernah
+  melebihi `timeout_ms`.
+
+#### `scrapers/deepseek_scraper.py` — `_select_model_tab()`
+- Lewati seluruh pencarian + klik tab bila mode yang diminta == mode default.
+  Chat baru selalu terbuka pada mode default, jadi tidak ada yang perlu diubah
+  pada jalur "instant" yang paling umum. Timeout pencarian tab diturunkan ke
+  `timeouts.element_find`.
+
+#### `scrapers/deepseek_scraper.py` — `_set_toggle()`
+- Timeout pencarian toggle DeepThink/Search diturunkan dari 2500ms ke
+  `timeouts.element_find` (1500ms), memanfaatkan fast-path `_find_first`.
+
+#### `scrapers/deepseek_scraper.py` — `_goto_new_chat()`
+- Reset `_active_model_tab = None` saat membuka chat baru (chat baru me-reset
+  mode pills ke default) agar keputusan `_select_model_tab()` tetap benar.
+
+#### `config.py` — timeouts & typing
+- `stability_polls`: 4 → **2** dan `poll_interval`: 0.8 → **0.5** → ekor
+  stabilitas turun dari **3.2s → 1.0s** (~2.2s hemat per proses).
+- `between_actions`: 0.4 → **0.2** (~1s hemat akumulatif per proses).
+- `type_delay_ms`: 15 → **0** — key event tetap dikirim per karakter, tetapi
+  tanpa delay buatan (prompt 200 karakter ≈ 3s hemat).
+- Tambah kunci baru `timeouts.element_find` (1500ms) sebagai budget bersama
+  pencarian elemen UI.
+
+### New — Timing Instrumentation (INFO log)
+- `scrapers/base_scraper.py` `scrape()` kini mencetak ringkasan per tahap:
+  `[TIMING] auth=… send=… wait=… total=… (mode=…)`.
+- `scrapers/deepseek_scraper.py` `send_prompt()` mencetak rincian sub-tahap:
+  `[TIMING] send_prompt: nav=… controls=… type=… send=… (mode=…)`.
+- Memudahkan menemukan bottleneck nyata tanpa menambah dependensi.
+
+### Impact
+- Estimasi penghematan overhead non-model: **~6–13 detik per proses** pada
+  kasus umum (terutama dari perbaikan `_find_first`, skip tab default, ekor
+  stabilitas, dan typing delay). Waktu generasi model tetap apa adanya.
 
 ---
 

@@ -61,12 +61,11 @@ BROWSER_CONFIG: dict = {
     "user_agent": USER_AGENT,
     "locale": "en-US",
     "timezone_id": "Asia/Jakarta",
-    # Per-character typing delay (ms) — kept for reference but no longer used.
-    # send_prompt() now uses fill() for instant input; see fill_settle_ms below.
-    "type_delay_ms": 15,
-    # Sleep (ms) after fill() to let the React SPA register the input event
-    # before the send button is clicked. Much faster than type() per-char delay.
-    "fill_settle_ms": 120,
+    # Per-character typing delay (ms) to look human while typing the prompt.
+    # OPTIMISATION: 15 -> 0. Key events are still dispatched per character (so
+    # the site's input handlers fire), but without the artificial delay a long
+    # prompt no longer costs len(prompt) * 15ms (e.g. 200 chars = 3s saved).
+    "type_delay_ms": 0,
 }
 
 # Extra Chromium launch args used to reduce automation fingerprinting.
@@ -157,30 +156,15 @@ DEEPSEEK_CONFIG: dict = {
         ],
         # Container holding rendered AI response markdown. DeepSeek uses the
         # ds- product namespace; .ds-markdown is the rendered response body.
-        # CONFIRMED (June 2026): class is 'ds-markdown ds-assistant-message-main-content'
         "response_container": [
-            "div.ds-assistant-message-main-content",
-            "div.ds-markdown.ds-assistant-message-main-content",
             "div.ds-markdown",
-            "div[class*='ds-assistant-message-main-content']",
             "div[class*='ds-markdown']",
+            "div[class*='markdown']",
         ],
         # The latest assistant message specifically (last response bubble).
-        #
-        # CONFIRMED DOM (June 2026):
-        #   class = 'ds-markdown ds-assistant-message-main-content'
-        #   No data-role attribute on the element itself.
-        #
-        # CRITICAL: DeepSeek uses a virtual list (ds-virtual-list) — only
-        # messages visible in the viewport are in the DOM. skip_count based
-        # counting is unreliable. We read the LAST visible element directly.
-        # The selector must NOT use :last-of-type (always count=1 in Playwright).
         "assistant_message": [
-            "div.ds-assistant-message-main-content",
-            "div.ds-markdown.ds-assistant-message-main-content",
-            "div[class*='ds-assistant-message-main-content']",
-            "div.ds-markdown",
-            "div[class*='ds-markdown']",
+            "div.ds-markdown:last-of-type",
+            "div[class*='ds-markdown']:last-of-type",
         ],
         # "Typing"/generation in-progress indicator. TODO: verify.
         "loading_indicator": [
@@ -188,28 +172,10 @@ DEEPSEEK_CONFIG: dict = {
             "div[class*='_typing']",
             "svg[class*='spin']",
         ],
-        # Stop-generation button shown while streaming.
-        #
-        # FIX (Bug #2): Extended with selectors that target the square-stop icon
-        # DeepSeek renders during active streaming. The button disappears when
-        # generation finishes — wait_for_response uses its absence as the primary
-        # "done" signal (more reliable than stability polling alone).
-        #
-        # Verified DOM (June 2026): the stop button is a ds-button--circle with
-        # a square SVG icon (not the send arrow). It carries ds-button--primary
-        # while streaming and is removed from the DOM when generation ends.
+        # Stop-generation button shown while streaming. TODO: verify.
         "stop_button": [
-            # Structural: circle ds-button that is NOT the send button
-            # (send button gets ds-button--disabled when streaming; stop button does not)
-            ".ds-button--circle.ds-button--primary:not(.ds-button--disabled):has(svg[class*='stop'])",
-            ".ds-button--circle:has(svg[class*='stop'])",
-            # aria / role fallbacks
             'div[role="button"][aria-label*="stop" i]',
-            'button[aria-label*="stop" i]',
             "div.ds-icon-button[aria-label*='stop' i]",
-            # Class-fragment fallback (last resort — broad)
-            'div[class*="stop-btn"]',
-            'div[class*="stopBtn"]',
             'div[class*="stop"]',
         ],
         # "New chat" button in the top-left sidebar. TODO: verify.
@@ -408,9 +374,19 @@ DEEPSEEK_CONFIG: dict = {
         "page_load": 60,
         "response_wait": 300,
         "stability_check": 2.0,      # how long content must be unchanged
-        "stability_polls": 2,        # consecutive stable polls required (was 4 — halved for speed)
-        "poll_interval": 0.5,        # poll every 0.5s (was 0.8s — faster detection)
-        "between_actions": 0.4,
+        # OPTIMISATION: stability tail = stability_polls * poll_interval.
+        # Was 4 * 0.8 = 3.2s of dead time AFTER every answer finished.
+        # Now 2 * 0.5 = 1.0s -> ~2.2s saved per process while still requiring
+        # the response text to be unchanged across two consecutive reads.
+        "stability_polls": 2,        # consecutive stable polls required
+        "poll_interval": 0.5,
+        # OPTIMISATION: small UI settle pause between actions, halved (0.4 -> 0.2).
+        # Called ~4-5x per process -> ~1s saved.
+        "between_actions": 0.2,
+        # OPTIMISATION: shared budget cap for locating a UI element (mode pills,
+        # tool toggles, etc.). Used by _find_first so a missing element no longer
+        # burns a full multi-second timeout per selector candidate.
+        "element_find": 1500,
     },
 }
 

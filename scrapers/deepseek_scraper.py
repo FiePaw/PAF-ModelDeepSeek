@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import mimetypes
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -49,13 +50,38 @@ class DeepSeekScraper(BaseAIChatScraper):
     # Generic selector helpers
     # ------------------------------------------------------------------ #
     async def _find_first(self, selectors: list[str], timeout_ms: int = 4000):
-        """Return the first locator (from a list) that resolves to >=1 element."""
+        """Return the first locator (from a list) that resolves to >=1 element.
+
+        OPTIMISATION (two-phase, total-budget aware):
+          Phase 1 (instant): a no-wait existence check across all selectors.
+            Covers the common case where the element is already in the DOM and
+            returns immediately (no timeout cost at all).
+          Phase 2 (bounded wait): only if phase 1 finds nothing. The timeout
+            budget is SHARED across the selector candidates instead of being
+            spent in full on each one. Previously a list of N selectors where
+            none matched cost up to ``timeout_ms * N`` (e.g. 3 selectors x
+            2500ms = 7.5s wasted). Now the total wait never exceeds timeout_ms.
+        """
         if self.page is None:
             return None
+
+        # --- Phase 1: instant existence check (no waiting) -------------------
         for sel in selectors:
             try:
                 loc = self.page.locator(sel)
-                await loc.first.wait_for(state="attached", timeout=timeout_ms)
+                if await loc.count():
+                    return loc.first
+            except Exception:
+                continue
+
+        # --- Phase 2: bounded wait, budget shared across selectors ----------
+        if not selectors:
+            return None
+        per_selector = max(250, timeout_ms // len(selectors))
+        for sel in selectors:
+            try:
+                loc = self.page.locator(sel)
+                await loc.first.wait_for(state="attached", timeout=per_selector)
                 if await loc.count():
                     return loc.first
             except Exception:
@@ -163,8 +189,22 @@ class DeepSeekScraper(BaseAIChatScraper):
             log.warning("Unknown model_tab '%s'; staying on current tab", model_tab)
             return
 
+        # OPTIMISATION: a brand-new DeepSeek chat always opens on the default
+        # mode, and _select_model_tab is only ever called on a fresh chat (NEW
+        # mode). When the caller wants that same default mode there is nothing
+        # to change -> skip the DOM lookup + active-state checks + click
+        # entirely. This is the common "instant" path and saves a full element
+        # search every process.
+        if model_tab == DEEPSEEK_CONFIG["default_model_tab"]:
+            log.debug(
+                "Mode '%s' is the default on a fresh chat; skipping tab selection.",
+                model_tab,
+            )
+            self._active_model_tab = model_tab
+            return
+
         # --- Attempt 1: use configured selectors (fast path) -----------------
-        loc = await self._find_first(tab_selectors, timeout_ms=3000)
+        loc = await self._find_first(tab_selectors, timeout_ms=_T["element_find"])
 
         # --- Attempt 2: text-content scan fallback ---------------------------
         # DeepSeek mode pills are plain divs whose only stable attribute is
@@ -285,7 +325,7 @@ class DeepSeekScraper(BaseAIChatScraper):
             )
             return
 
-        loc = await self._find_first(selectors, timeout_ms=2500)
+        loc = await self._find_first(selectors, timeout_ms=_T["element_find"])
         if loc is None:
             # Tool should be present (matrix says so) but wasn't found —
             # this is a genuine selector mismatch worth warning about.
@@ -346,6 +386,10 @@ class DeepSeekScraper(BaseAIChatScraper):
         await asyncio.sleep(_T["between_actions"])
         # CRITICAL: reset flag so the next send_prompt() treats this as turn 1.
         self._conversation_started = False
+        # A fresh chat resets DeepSeek's mode pills back to the default, so any
+        # cached "active mode" no longer reflects the page. Clear it so the next
+        # _select_model_tab() makes a correct decision.
+        self._active_model_tab = None
         log.debug("_goto_new_chat: landed on new-chat page, _conversation_started=False")
 
     async def _ensure_page_ready(self, mode: str) -> None:
@@ -411,28 +455,9 @@ class DeepSeekScraper(BaseAIChatScraper):
         DOM is showing (fresh profile or expired session) -> log in with the
         email + password from cookies/auth.json for the current account, which
         repopulates the persistent profile. Returns True on success.
-
-        OPTIMISATION: skip the DOM check entirely when _authenticated=True and
-        the browser is still on a DeepSeek page. The DOM check (is_session_expired)
-        queries multiple selectors on every request — expensive for a condition
-        that almost never changes mid-session. We only do the full DOM check on
-        the first call per browser session, after a rotation/restart (both reset
-        _authenticated=False), or when the page URL has drifted off DeepSeek.
         """
         if self.page is None:
             return False
-
-        # Fast path: already confirmed authenticated this session AND still on
-        # a DeepSeek page. Skip the DOM check entirely.
-        if self._authenticated:
-            current_url = self.page.url or ""
-            if DEEPSEEK_CONFIG["base_url"] in current_url:
-                log.debug("ensure_authenticated: cache hit — skipping DOM check")
-                return True
-            # URL drifted (e.g. external redirect). Fall through to full check.
-            log.debug(
-                "ensure_authenticated: URL drifted to '%s' — re-checking", current_url[:80]
-            )
 
         if not await self.is_session_expired():
             self._authenticated = True
@@ -601,8 +626,12 @@ class DeepSeekScraper(BaseAIChatScraper):
           • Initial load / auth → ChatClient.launch() or base_scraper.scrape()
           • Navigation gate    → _ensure_page_ready() (this function, line below)
         """
+        # --- TIMING instrumentation (sub-stages of send_prompt) -------------
+        _s0 = time.monotonic()
+
         # Sole navigation gate — decides new chat vs continue existing thread.
         await self._ensure_page_ready(mode)
+        _s_nav = time.monotonic()
 
         if mode == "new":
             # Select mode first — determines which tools are available.
@@ -623,6 +652,8 @@ class DeepSeekScraper(BaseAIChatScraper):
                 "(controls are hidden in an active conversation)"
             )
 
+        _s_ctrl = time.monotonic()
+
         # Attachments (image/doc) via clipboard paste.
         if attachments:
             for att in attachments:
@@ -635,11 +666,12 @@ class DeepSeekScraper(BaseAIChatScraper):
                 "Chat input not found (TODO: verify #chat-input selector)."
             )
         await input_loc.click()
-        # Use fill() for instant input instead of type() char-by-char.
-        # A single short sleep after fill() is enough to let the SPA register
-        # the input event before the send button is clicked.
-        await input_loc.fill(prompt)
-        await asyncio.sleep(BROWSER_CONFIG.get("fill_settle_ms", 120) / 1000)
+        # Type the prompt. type_delay_ms is 0 by default (see config) so key
+        # events still fire per character but without artificial latency.
+        await input_loc.fill("")
+        await input_loc.type(prompt, delay=BROWSER_CONFIG.get("type_delay_ms", 0))
+        await asyncio.sleep(_T["between_actions"])
+        _s_type = time.monotonic()
 
         # Send: prefer clicking the send button; fall back to Enter.
         sent = await self._click_first(_SEL["send_button"], timeout_ms=4000)
@@ -649,6 +681,17 @@ class DeepSeekScraper(BaseAIChatScraper):
 
         # Mark conversation as active so future CONTINUE calls skip navigation.
         self._conversation_started = True
+
+        # One-line breakdown of where send_prompt spent its time.
+        log.info(
+            "[TIMING] send_prompt: nav=%.2fs controls=%.2fs type=%.2fs "
+            "send=%.2fs (mode=%s)",
+            _s_nav - _s0,
+            _s_ctrl - _s_nav,
+            _s_type - _s_ctrl,
+            time.monotonic() - _s_type,
+            mode,
+        )
 
         # Return the selector wait_for_response should poll.
         return _SEL["assistant_message"][0]
@@ -720,7 +763,6 @@ class DeepSeekScraper(BaseAIChatScraper):
                 await self.launch_browser(self.account)
 
             initial_response_count = await self._count_response_elements()
-            await self._snapshot_baseline_text()
             await self.send_prompt(wrapped_prompt, mode="continue")
 
             from config import DEEPSEEK_CONFIG as _DS_CFG

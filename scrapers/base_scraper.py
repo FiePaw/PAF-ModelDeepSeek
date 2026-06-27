@@ -314,158 +314,23 @@ class BaseAIChatScraper(ABC):
     # ------------------------------------------------------------------ #
     async def _count_response_elements(self) -> int:
         """
-        Count visible assistant response elements on the page via JS evaluate.
+        Count how many assistant response elements currently exist on the page.
 
-        CRITICAL — DeepSeek Virtual List:
-            DeepSeek renders messages in a ds-virtual-list: only items currently
-            visible in the viewport exist in the DOM. A Playwright locator.count()
-            call only sees visible elements, so the count fluctuates as the user
-            (or automation) scrolls. This makes skip_count unreliable for CONTINUE
-            mode — the baseline taken before send_prompt() may differ from the
-            count seen during Phase 2 polling.
-
-            Solution: use JS evaluate to count elements in a single round-trip,
-            and store the last visible assistant message TEXT (not count) as the
-            anchor. See wait_for_response / _read_latest_response.
+        Called immediately BEFORE send_prompt() to snapshot the baseline in
+        CONTINUE mode. The result is passed to wait_for_response() so it can
+        anchor to the NEW response instead of re-reading an old one.
         """
         if self.page is None:
             return 0
-        try:
-            count = await self.page.evaluate("""
-            () => {
-                const sels = [
-                    'div.ds-assistant-message-main-content',
-                    'div.ds-markdown.ds-assistant-message-main-content',
-                    'div[class*="ds-assistant-message-main-content"]',
-                    'div.ds-markdown',
-                ];
-                for (const s of sels) {
-                    const els = document.querySelectorAll(s);
-                    if (els.length > 0) return els.length;
-                }
-                return 0;
-            }
-            """)
-            count = int(count or 0)
-            log.debug("Response element baseline count (JS): %d", count)
-            return count
-        except Exception:
-            return 0
-
-    async def _snapshot_baseline_text(self) -> None:
-        """
-        Capture the text of the current last assistant response BEFORE sending
-        the next prompt. Stored in self._baseline_response_text.
-
-        _read_latest_response uses this in CONTINUE mode to distinguish between
-        the old response (still visible while the new one loads) and the new
-        response. This is necessary because DeepSeek's virtual list keeps the
-        previous message in the DOM and auto-scrolls to the new one — without
-        a text anchor we'd return the old message immediately.
-
-        Called from scrape() before send_prompt().
-        """
-        if self.page is None:
-            self._baseline_response_text = None
-            return
-        try:
-            text = await self.page.evaluate("""
-            () => {
-                const sels = [
-                    'div.ds-assistant-message-main-content',
-                    'div.ds-markdown.ds-assistant-message-main-content',
-                    'div[class*="ds-assistant-message-main-content"]',
-                    'div.ds-markdown',
-                ];
-                for (const s of sels) {
-                    const els = document.querySelectorAll(s);
-                    if (els.length > 0) {
-                        const last = els[els.length - 1];
-                        const t = (last.innerText || '').trim();
-                        if (t.length > 0) return t;
-                    }
-                }
-                return '';
-            }
-            """)
-            self._baseline_response_text = (text or "").strip() or None
-            log.debug(
-                "_snapshot_baseline_text: captured %d chars",
-                len(self._baseline_response_text) if self._baseline_response_text else 0,
-            )
-        except Exception:
-            self._baseline_response_text = None
-
-    async def _is_stop_button_present(self) -> bool:
-        """
-        Return True if the stop-generation button is currently visible on the page.
-
-        Used by wait_for_response() as the primary "still streaming" signal.
-        The stop button appears as soon as DeepSeek starts streaming and is
-        removed from the DOM when generation finishes — more reliable than
-        waiting for text content to stabilise, because DeepSeek may re-render
-        (syntax highlighting, math) AFTER streaming ends, which causes
-        stability-only polling to keep resetting.
-
-        FIX (Performance): Replaced per-selector Playwright locator loop (N CDP
-        round-trips) with a single page.evaluate() call (1 round-trip JS) —
-        same approach used by PAF-ModelQwen._is_generating(). This eliminates
-        the 8x CDP overhead on every poll during Phase 1.
-
-        Selector strategy inside JS (ordered most-specific → most-permissive):
-          1. .ds-button--circle + ds-button--primary (NOT disabled) — active send
-             area; during streaming the send button gets --disabled while a
-             separate stop button keeps --primary without --disabled.
-          2. aria-label containing "stop" (any element, case-insensitive).
-          3. class fragment "stop-btn" / "stopBtn" — minified class fallbacks.
-          4. Streaming/typing indicators (broader fallback when stop btn absent).
-        NOTE: :has() is NOT available in querySelectorAll; the JS uses a manual
-        parent-child walk for the ds-button check instead.
-        """
-        if self.page is None:
-            return False
-        try:
-            result = await self.page.evaluate("""
-            () => {
-                // 1. ds-button--circle + primary, NOT disabled (active stop btn)
-                const circleBtns = document.querySelectorAll(
-                    '.ds-button--circle.ds-button--primary:not(.ds-button--disabled)'
-                );
-                for (const btn of circleBtns) {
-                    if (btn.offsetParent !== null) return true;
-                }
-                // 2. aria-label containing "stop" (case-insensitive)
-                const ariaStop = document.querySelectorAll('[aria-label]');
-                for (const el of ariaStop) {
-                    const label = (el.getAttribute('aria-label') || '').toLowerCase();
-                    if (label.includes('stop') && el.offsetParent !== null) return true;
-                }
-                // 3. Class fragment fallbacks
-                const classFrag = document.querySelectorAll(
-                    '[class*="stop-btn"],[class*="stopBtn"]'
-                );
-                for (const el of classFrag) {
-                    if (el.offsetParent !== null) return true;
-                }
-                // 4. Streaming / typing indicators (fallback)
-                const streamSels = [
-                    '[class*="streaming"]',
-                    '[class*="typing"]',
-                    '[class*="generating"]',
-                    '[class*="loading-dots"]',
-                    '[class*="cursor-blink"]',
-                    '.result-streaming',
-                ];
-                for (const s of streamSels) {
-                    const el = document.querySelector(s);
-                    if (el && el.offsetParent !== null) return true;
-                }
-                return false;
-            }
-            """)
-            return bool(result)
-        except Exception:
-            return False
+        for sel in self._response_selectors():
+            try:
+                count = await self.page.locator(sel).count()
+                if count >= 0:
+                    log.debug("Response element baseline count: %d (selector: %s)", count, sel)
+                    return count
+            except Exception:
+                continue
+        return 0
 
     async def wait_for_response(
         self,
@@ -477,92 +342,31 @@ class BaseAIChatScraper(ABC):
         initial_response_count: int = 0,
     ) -> str:
         """
-        Wait until the AI response is complete and stable.
-
-        FIX (Bug #2): Two-phase strategy that avoids the re-render reset problem.
-
-        Phase 1 — "Stop button gone" (primary signal):
-            Poll until the stop-generation button disappears from the DOM.
-            This is the most reliable indicator that DeepSeek has finished
-            streaming — the button is shown during generation and removed on
-            completion. Avoids the stability-counter being reset by post-stream
-            re-renders (syntax highlighting, math, etc.).
-
-            If the stop button was never detected in the first 10 % of the
-            timeout (i.e. it might not exist / selector mismatch), we fall
-            through to Phase 2 immediately so we don't hang forever.
-
-        Phase 2 — "Stable text" (confirmation / fallback):
-            Once the stop button is gone (or was never seen), require the
-            response text to be non-empty AND unchanged for `stability_polls`
-            consecutive polls. This acts as a safety net for cases where the
-            stop button selector has drifted.
+        Wait until the AI response stops changing. The response is considered
+        complete when its text is non-empty AND unchanged for `stability_polls`
+        consecutive polls. More robust than waiting for a loading indicator.
 
         Args:
-            initial_response_count: Baseline element count taken BEFORE the
-                prompt was sent (see _count_response_elements). Elements at
-                index < initial_response_count are old responses (CONTINUE mode)
-                and must be skipped. Default 0 for NEW mode.
+            initial_response_count: Number of assistant response elements that
+                existed on the page BEFORE the prompt was sent (snapshot taken
+                by _count_response_elements()). In CONTINUE mode the page
+                already has N old responses — we must wait until count > N
+                before reading, otherwise we immediately read an old stable
+                response and return it as if it were the new one.
+                Defaults to 0 (NEW mode: no prior responses on page).
         """
         deadline = time.monotonic() + timeout
         last_text = ""
         stable_count = 0
 
-        # ------------------------------------------------------------------ #
-        # Phase 1: wait for the stop button to appear, then disappear.
-        # ------------------------------------------------------------------ #
-        # Grace window: give DeepSeek time to show the stop button before we
-        # decide it was never present. 10 % of total timeout, capped at 15 s.
-        grace_deadline = time.monotonic() + min(timeout * 0.10, 15.0)
-        stop_seen = False
-
-        while time.monotonic() < deadline:
-            if await self._is_stop_button_present():
-                stop_seen = True
-                log.debug("wait_for_response: stop button detected — streaming in progress")
-                break
-            # Stop button not yet visible.
-            if time.monotonic() >= grace_deadline:
-                # It didn't appear within the grace window — selector may have
-                # drifted. Fall through to stability-only Phase 2.
-                log.debug(
-                    "wait_for_response: stop button not seen within grace window "
-                    "(%.0fs) — falling back to stability-only mode",
-                    min(timeout * 0.10, 15.0),
-                )
-                break
-            await asyncio.sleep(poll_interval)
-
-        if stop_seen:
-            # Button appeared — now wait until it's gone (generation finished).
-            log.debug("wait_for_response: waiting for stop button to disappear")
-            while time.monotonic() < deadline:
-                if not await self._is_stop_button_present():
-                    log.debug("wait_for_response: stop button gone — generation complete")
-                    break
-                await asyncio.sleep(poll_interval)
-            # Small settle sleep so any post-stream DOM mutations (syntax
-            # highlighting, math rendering) can complete before we read text.
-            await asyncio.sleep(min(poll_interval, 0.5))
-
-        # ------------------------------------------------------------------ #
-        # Phase 2: confirm with stability polling (also the fallback path).
-        # ------------------------------------------------------------------ #
-        best_text = ""
         while time.monotonic() < deadline:
             text = await self._read_latest_response(
                 response_selectors,
                 skip_count=initial_response_count,
             )
-            if text:
-                best_text = text  # always track the latest non-empty text
             if text and text == last_text:
                 stable_count += 1
                 if stable_count >= stability_polls:
-                    log.debug(
-                        "wait_for_response: stable after %d polls (stop_seen=%s)",
-                        stable_count, stop_seen,
-                    )
                     return text
             else:
                 stable_count = 0
@@ -570,16 +374,7 @@ class BaseAIChatScraper(ABC):
             await asyncio.sleep(poll_interval)
 
         log.warning("wait_for_response timed out after %.0fs", timeout)
-        # Dump DOM so we can identify the correct selector from live logs.
-        await self._dump_dom_debug()
-        # Return best available text rather than empty string — response may
-        # have arrived but never stabilised within the timeout window.
-        if best_text:
-            log.warning(
-                "wait_for_response: returning best available text (%d chars) after timeout",
-                len(best_text),
-            )
-        return best_text
+        return last_text
 
     async def _read_latest_response(
         self,
@@ -587,110 +382,29 @@ class BaseAIChatScraper(ABC):
         skip_count: int = 0,
     ) -> str:
         """
-        Return the text of the latest assistant message via JS evaluate.
+        Return the text of the latest assistant message, trying selectors in order.
 
-        CRITICAL — DeepSeek Virtual List + skip_count problem:
-            DeepSeek renders messages in a ds-virtual-list. Only messages visible
-            in the viewport exist in the DOM at any time. This means:
-            1. locator.count() returns only visible elements (1-3 typically).
-            2. skip_count based on a pre-send baseline is unreliable — the virtual
-               list may have re-rendered different elements between baseline and poll.
-
-            Solution: use a single JS evaluate call that:
-            - Finds all matching elements via querySelectorAll (sees full DOM).
-            - Returns innerText of the LAST element only.
-            - If skip_count > 0 (CONTINUE mode), compares last element text against
-              the stored baseline text to detect whether it is truly NEW.
-              This is stored in self._baseline_response_text (set by
-              _snapshot_baseline_text before send_prompt).
-
-        Virtual list note: querySelectorAll in JS still only sees what's in the
-        DOM (visible items). But since DeepSeek always keeps the LATEST message
-        visible (it auto-scrolls), the last element in querySelectorAll IS the
-        newest response — exactly what we want.
+        Args:
+            skip_count: Ignore the first N elements (the pre-existing responses
+                in CONTINUE mode). Only read elements at index >= skip_count.
+                In NEW mode this is 0 so behaviour is unchanged.
         """
         if self.page is None:
             return ""
-        try:
-            text = await self.page.evaluate("""
-            () => {
-                const sels = [
-                    'div.ds-assistant-message-main-content',
-                    'div.ds-markdown.ds-assistant-message-main-content',
-                    'div[class*="ds-assistant-message-main-content"]',
-                    'div.ds-markdown',
-                    'div[class*="ds-markdown"]',
-                ];
-                for (const s of sels) {
-                    const els = document.querySelectorAll(s);
-                    if (els.length > 0) {
-                        const last = els[els.length - 1];
-                        const t = (last.innerText || '').trim();
-                        if (t.length > 0) return t;
-                    }
-                }
-                return '';
-            }
-            """)
-            text = (text or "").strip()
-            if not text:
-                return ""
-
-            # CONTINUE guard: if we have a baseline text snapshot, ignore the
-            # response until it differs from the pre-send state (i.e. a new
-            # response has actually appeared, not the previous one).
-            baseline = getattr(self, "_baseline_response_text", None)
-            if skip_count > 0 and baseline and text == baseline:
-                log.debug(
-                    "_read_latest_response: text matches baseline (%d chars) — "
-                    "new response not yet visible",
-                    len(text),
-                )
-                return ""
-
-            return text
-        except Exception as exc:
-            log.debug("_read_latest_response JS eval failed: %s", exc)
-            return ""
-
-    async def _dump_dom_debug(self) -> None:
-        """
-        One-shot DOM dump — called when response exists but scraper can't read it.
-        Logs class/id/role/text of divs with meaningful content so we can
-        identify the real selector to use.
-        """
-        if self.page is None:
-            return
-        try:
-            info = await self.page.evaluate("""
-            () => {
-                const results = [];
-                const divs = document.querySelectorAll('div');
-                for (const d of divs) {
-                    const txt = (d.innerText || '').trim();
-                    if (txt.length > 20 && txt.length < 500) {
-                        results.push({
-                            cls: d.className || '',
-                            id: d.id || '',
-                            role: d.getAttribute('data-role') || '',
-                            len: txt.length,
-                            preview: txt.slice(0, 80),
-                        });
-                    }
-                    if (results.length >= 40) break;
-                }
-                return results;
-            }
-            """)
-            log.warning("DOM DEBUG — divs with text content (url=%s):", self.page.url)
-            for item in (info or []):
-                log.warning(
-                    "  cls=%r id=%r role=%r len=%d | %r",
-                    item['cls'][:80], item['id'], item['role'],
-                    item['len'], item['preview'],
-                )
-        except Exception as exc:
-            log.warning("_dump_dom_debug failed: %s", exc)
+        for sel in selectors:
+            try:
+                loc = self.page.locator(sel)
+                count = await loc.count()
+                # Guard: only proceed if there is at least one NEW element
+                # beyond the baseline snapshot. This prevents returning a
+                # stale old response before DeepSeek begins streaming.
+                if count > skip_count:
+                    text = await loc.nth(count - 1).inner_text()
+                    if text and text.strip():
+                        return text.strip()
+            except Exception:
+                continue
+        return ""
 
     # ------------------------------------------------------------------ #
     # Extraction / saving
@@ -859,6 +573,13 @@ class BaseAIChatScraper(ABC):
 
         while retries <= max_retries:
             try:
+                # --- TIMING instrumentation -----------------------------------
+                # Records how long each stage of a single process takes so the
+                # slow part is measurable instead of guessed. Emitted once per
+                # attempt at log level INFO as a single [TIMING] line.
+                _t0 = time.monotonic()
+                _t_auth = _t_send = _t_wait = _t0
+
                 if await self._is_page_crashed():
                     await self.restart_browser(self.account)
 
@@ -868,21 +589,20 @@ class BaseAIChatScraper(ABC):
                     log.warning("Authentication failed; rotating account")
                     if not await self._rotate_account(restart_first=False):
                         raise RuntimeError("Login failed and no account to rotate")
+                _t_auth = time.monotonic()
 
-                # Snapshot the current last response TEXT before sending the prompt.
-                # In CONTINUE mode, _read_latest_response uses this to detect when
-                # a genuinely NEW response appears (different text from baseline).
-                # This replaces the unreliable count-based skip_count approach which
-                # broke on DeepSeek's virtual list rendering.
+                # Snapshot response count BEFORE sending the prompt.
+                # In CONTINUE mode the page already has N old responses;
+                # wait_for_response uses this baseline to skip them and only
+                # read the NEW response once it appears.
                 initial_response_count = await self._count_response_elements()
-                await self._snapshot_baseline_text()
                 log.debug(
-                    "Response baseline before send: count=%d baseline_text=%d chars",
+                    "Response baseline before send: %d element(s) on page",
                     initial_response_count,
-                    len(self._baseline_response_text or ""),
                 )
 
                 await self.send_prompt(prompt, mode=mode, **merged_kwargs)
+                _t_send = time.monotonic()
 
                 t = DEEPSEEK_CONFIG["timeouts"]
                 text = await self.wait_for_response(
@@ -892,6 +612,16 @@ class BaseAIChatScraper(ABC):
                     stability_polls=t["stability_polls"],
                     poll_interval=t["poll_interval"],
                     initial_response_count=initial_response_count,
+                )
+                _t_wait = time.monotonic()
+                log.info(
+                    "[TIMING] auth=%.2fs send=%.2fs wait=%.2fs total=%.2fs "
+                    "(mode=%s)",
+                    _t_auth - _t0,
+                    _t_send - _t_auth,
+                    _t_wait - _t_send,
+                    _t_wait - _t0,
+                    mode,
                 )
 
                 if await self.is_rate_limited():
