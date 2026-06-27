@@ -411,9 +411,28 @@ class DeepSeekScraper(BaseAIChatScraper):
         DOM is showing (fresh profile or expired session) -> log in with the
         email + password from cookies/auth.json for the current account, which
         repopulates the persistent profile. Returns True on success.
+
+        OPTIMISATION: skip the DOM check entirely when _authenticated=True and
+        the browser is still on a DeepSeek page. The DOM check (is_session_expired)
+        queries multiple selectors on every request — expensive for a condition
+        that almost never changes mid-session. We only do the full DOM check on
+        the first call per browser session, after a rotation/restart (both reset
+        _authenticated=False), or when the page URL has drifted off DeepSeek.
         """
         if self.page is None:
             return False
+
+        # Fast path: already confirmed authenticated this session AND still on
+        # a DeepSeek page. Skip the DOM check entirely.
+        if self._authenticated:
+            current_url = self.page.url or ""
+            if DEEPSEEK_CONFIG["base_url"] in current_url:
+                log.debug("ensure_authenticated: cache hit — skipping DOM check")
+                return True
+            # URL drifted (e.g. external redirect). Fall through to full check.
+            log.debug(
+                "ensure_authenticated: URL drifted to '%s' — re-checking", current_url[:80]
+            )
 
         if not await self.is_session_expired():
             self._authenticated = True
@@ -616,10 +635,11 @@ class DeepSeekScraper(BaseAIChatScraper):
                 "Chat input not found (TODO: verify #chat-input selector)."
             )
         await input_loc.click()
-        # Use type() with a small per-char delay to look human.
-        await input_loc.fill("")
-        await input_loc.type(prompt, delay=BROWSER_CONFIG.get("type_delay_ms", 15))
-        await asyncio.sleep(_T["between_actions"])
+        # Use fill() for instant input instead of type() char-by-char.
+        # A single short sleep after fill() is enough to let the SPA register
+        # the input event before the send button is clicked.
+        await input_loc.fill(prompt)
+        await asyncio.sleep(BROWSER_CONFIG.get("fill_settle_ms", 120) / 1000)
 
         # Send: prefer clicking the send button; fall back to Enter.
         sent = await self._click_first(_SEL["send_button"], timeout_ms=4000)

@@ -61,8 +61,12 @@ BROWSER_CONFIG: dict = {
     "user_agent": USER_AGENT,
     "locale": "en-US",
     "timezone_id": "Asia/Jakarta",
-    # Per-character typing delay (ms) to look human while typing the prompt.
+    # Per-character typing delay (ms) — kept for reference but no longer used.
+    # send_prompt() now uses fill() for instant input; see fill_settle_ms below.
     "type_delay_ms": 15,
+    # Sleep (ms) after fill() to let the React SPA register the input event
+    # before the send button is clicked. Much faster than type() per-char delay.
+    "fill_settle_ms": 120,
 }
 
 # Extra Chromium launch args used to reduce automation fingerprinting.

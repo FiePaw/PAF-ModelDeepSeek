@@ -5,6 +5,73 @@ Format: `[version] YYYY-MM-DD — summary`
 
 ---
 
+## [2.1.1] 2026-06-27 — Optimisasi performa: input fill & auth cache
+
+Dua optimisasi performa ringan yang tidak mengubah perilaku fungsional.
+
+---
+
+### Performance
+
+#### `send_prompt()` — ganti `type()` dengan `fill()` (`scrapers/deepseek_scraper.py`)
+
+`input_loc.type(prompt, delay=15)` mengetik karakter satu per satu dengan jeda
+15ms per karakter untuk terlihat "human". Untuk prompt 200 karakter, ini
+memakan **~3 detik** hanya pada tahap input.
+
+Diganti dengan `input_loc.fill(prompt)` yang men-set value sekaligus, diikuti
+satu `asyncio.sleep` pendek (`fill_settle_ms`) agar React SPA sempat meregistrasi
+input event sebelum tombol send diklik.
+
+```python
+# Sebelum (~3s untuk prompt 200 char):
+await input_loc.fill("")
+await input_loc.type(prompt, delay=15)
+await asyncio.sleep(0.4)
+
+# Sesudah (~0.12s flat):
+await input_loc.fill(prompt)
+await asyncio.sleep(BROWSER_CONFIG.get("fill_settle_ms", 120) / 1000)
+```
+
+Konfigurasi `fill_settle_ms` (default: `120`) tersedia di `BROWSER_CONFIG`
+pada `config.py` untuk penyesuaian jika SPA butuh waktu lebih lama.
+
+#### `ensure_authenticated()` — auth cache per-session (`scrapers/deepseek_scraper.py`)
+
+Sebelumnya `ensure_authenticated()` selalu memanggil `is_session_expired()` di
+setiap `scrape()` — artinya setiap request melakukan DOM query (cek URL, cek
+`input[type="password"]`, cek `query_selector` chat input, bahkan `inner_text("body")`
+sebagai last resort). Ini overhead yang sia-sia karena session hampir tidak pernah
+expired di tengah-tengah penggunaan normal.
+
+Kini `ensure_authenticated()` mempunyai fast path: jika `_authenticated=True`
+**dan** browser masih berada di domain DeepSeek, langsung return `True` tanpa
+menyentuh DOM sama sekali.
+
+```python
+# Fast path (hampir selalu diambil setelah request pertama):
+if self._authenticated:
+    if DEEPSEEK_CONFIG["base_url"] in self.page.url:
+        return True   # skip seluruh DOM check
+```
+
+Cache ter-invalidasi otomatis pada tiga kondisi yang sudah ada:
+- `restart_browser()` → `_authenticated = False`
+- `_rotate_account()` → `_authenticated = False`
+- URL drift ke luar domain DeepSeek → fallback ke full DOM check
+
+---
+
+### Config
+
+#### `config.py` — `BROWSER_CONFIG`
+
+- Tambah `fill_settle_ms: 120` — durasi sleep (ms) setelah `fill()` sebelum klik send.
+- `type_delay_ms` dipertahankan sebagai referensi tapi tidak lagi dipakai oleh scraper.
+
+---
+
 ## [2.1.0] 2026-06-27 — Session persistence overhaul, Turn 2 tool-result, CONTINUE mode bug fixes
 
 Rilis ini membawa arsitektur session baru yang sepenuhnya mengadopsi pola
