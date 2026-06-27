@@ -456,6 +456,10 @@ ROTATION_CONFIG: dict = {
     "rotation_delay": 5.0,
     "max_browser_restarts": 3,
     "browser_restart_delay": 4.0,
+    # How long (seconds) a session stays alive after its last use.
+    # After this period, get() returns None and the file is deleted from disk.
+    # Matches Qwen's default TTL.
+    "session_ttl": 3600,
 }
 
 

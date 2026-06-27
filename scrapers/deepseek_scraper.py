@@ -39,6 +39,11 @@ class DeepSeekScraper(BaseAIChatScraper):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._active_model_tab: str = DEEPSEEK_CONFIG["default_model_tab"]
+        # Tracks whether we are inside an active conversation thread.
+        # Set to True once a prompt has been sent (or when CONTINUE navigation
+        # lands on an existing thread). Reset to False by _goto_new_chat().
+        # Mirrors the same flag used by PAF-ModelQwen.
+        self._conversation_started: bool = False
 
     # ------------------------------------------------------------------ #
     # Generic selector helpers
@@ -318,6 +323,15 @@ class DeepSeekScraper(BaseAIChatScraper):
     # Navigation
     # ------------------------------------------------------------------ #
     async def _goto_new_chat(self) -> None:
+        """
+        Navigate to a fresh chat page.
+
+        Strategy (mirrors PAF-ModelQwen):
+          1. Try the in-app "New chat" button — keeps the SPA warm, faster.
+          2. Fall back to hard page.goto() if the button is absent.
+        Always resets _conversation_started so the next send_prompt() knows it
+        is starting a brand-new thread.
+        """
         if self.page is None:
             return
         # Prefer the in-app New chat button (keeps SPA state warm); fall back to
@@ -330,6 +344,47 @@ class DeepSeekScraper(BaseAIChatScraper):
                 timeout=_T["page_load"] * 1000,
             )
         await asyncio.sleep(_T["between_actions"])
+        # CRITICAL: reset flag so the next send_prompt() treats this as turn 1.
+        self._conversation_started = False
+        log.debug("_goto_new_chat: landed on new-chat page, _conversation_started=False")
+
+    async def _ensure_page_ready(self, mode: str) -> None:
+        """
+        Single navigation gate — mirrors PAF-ModelQwen exactly.
+
+        NEW  → always call _goto_new_chat() to land on a fresh thread.
+        CONTINUE + _conversation_started=True
+             → verify we are still on a DeepSeek page (URL sanity check).
+               If the page drifted away (e.g. due to a rotation/restart), fall
+               back to a new chat rather than silently sending to the wrong page.
+        CONTINUE + _conversation_started=False
+             → treat as NEW (safe fallback for first turn after a restart).
+
+        NOTE: no authentication checks here — that is handled at a higher
+        level (base_scraper.scrape → ensure_authenticated). This keeps the
+        method side-effect-free for the CONTINUE path, exactly as Qwen does.
+        """
+        if mode == "new" or not self._conversation_started:
+            await self._goto_new_chat()
+        else:
+            # CONTINUE: verify the browser is still on a DeepSeek page.
+            # If _conversation_started=True but something (rotation, restart,
+            # auth redirect) navigated the browser away, we would silently send
+            # the prompt to the wrong page — same bug Qwen guards against by
+            # always doing the navigation in public.py before calling scrape().
+            current_url = self.page.url if self.page else ""
+            if not current_url or DEEPSEEK_CONFIG["base_url"] not in current_url:
+                log.warning(
+                    "_ensure_page_ready: CONTINUE requested but page is at '%s' "
+                    "(not a DeepSeek conversation) — opening new chat as fallback.",
+                    current_url[:80],
+                )
+                await self._goto_new_chat()
+            else:
+                log.debug(
+                    "_ensure_page_ready: CONTINUE — page at %s, skipping navigation.",
+                    current_url[:80],
+                )
 
     async def _ensure_loaded(self) -> None:
         if self.page is None:
@@ -510,15 +565,27 @@ class DeepSeekScraper(BaseAIChatScraper):
         """
         Send a prompt to DeepSeek.
 
-        Order: (new -> open new chat) -> select mode (Instant/Expert/Vision) ->
-        enable tools (DeepThink/Search) -> attach files -> type prompt -> send.
-        Returns a handle string (here, the active response selector) for
-        wait_for_response.
+        Order:
+          _ensure_page_ready(mode)      ← sole navigation gate (Qwen-style)
+          [NEW only] select mode tab    ← Instant / Expert / Vision
+          [NEW only] enable tools       ← DeepThink / Search
+          attach files (both modes)
+          type prompt → send
+        Returns the response selector string consumed by wait_for_response().
+
+        FIX: _ensure_loaded() has been intentionally removed from here.
+        Calling it inside send_prompt() introduced a second authentication check
+        that could call login() → page.goto(login_url) AFTER the caller already
+        navigated to a conversation URL, silently destroying the CONTINUE context.
+        Qwen's send_prompt() does not call any auth/load helper — it only calls
+        _ensure_page_ready(). We follow the same contract:
+          • Initial load / auth → ChatClient.launch() or base_scraper.scrape()
+          • Navigation gate    → _ensure_page_ready() (this function, line below)
         """
-        await self._ensure_loaded()
+        # Sole navigation gate — decides new chat vs continue existing thread.
+        await self._ensure_page_ready(mode)
 
         if mode == "new":
-            await self._goto_new_chat()
             # Select mode first — determines which tools are available.
             await self._select_model_tab(model_tab)
             # Enable tools — checked AFTER mode selection (availability differs per mode).
@@ -560,8 +627,115 @@ class DeepSeekScraper(BaseAIChatScraper):
             log.info("Send button not clickable; pressing Enter as fallback")
             await input_loc.press("Enter")
 
+        # Mark conversation as active so future CONTINUE calls skip navigation.
+        self._conversation_started = True
+
         # Return the selector wait_for_response should poll.
         return _SEL["assistant_message"][0]
+
+    # ------------------------------------------------------------------ #
+    # Turn 2: tool-result injection (mirrors PAF-ModelQwen)
+    # ------------------------------------------------------------------ #
+    async def scrape_with_tool_result(
+        self,
+        tool_messages: list[dict],
+        next_user_msg: Optional[str] = None,
+    ) -> dict:
+        """
+        Inject tool results back into an existing CONTINUE conversation (Turn 2).
+
+        Builds a structured prompt:
+
+            [TOOL RESULT]
+            {"tool_call_id": "...", "name": "...", "result": {...}}
+            ... (one block per tool message)
+
+            [USER REQUEST]              <- only if next_user_msg is provided
+            {"prompt": "..."}
+
+        Then calls send_prompt() in CONTINUE mode (no new-chat navigation) and
+        waits for the model response exactly like a normal scrape() call.
+
+        Returns a dict in the same shape as scrape():
+          {"ok": True, "mode": "continue", "account": ..., "text": ..., ...}
+        """
+        import json as _json
+        from datetime import datetime
+
+        parts: list[str] = []
+
+        for tm in tool_messages:
+            # Normalise: accept both {"result": ...} and {"content": ...}
+            result_val = tm.get("result") or tm.get("content") or ""
+            if isinstance(result_val, (dict, list)):
+                result_str = _json.dumps(result_val, ensure_ascii=False)
+            else:
+                result_str = str(result_val)
+
+            block = {
+                "tool_call_id": tm.get("tool_call_id", ""),
+                "name":         tm.get("name", tm.get("tool_name", "")),
+                "result":       result_str,
+            }
+            parts.append("[TOOL RESULT]\n" + _json.dumps(block, ensure_ascii=False))
+
+        if next_user_msg:
+            parts.append(
+                "[USER REQUEST]\n"
+                + _json.dumps({"prompt": next_user_msg}, ensure_ascii=False)
+            )
+
+        wrapped_prompt = "\n\n".join(parts)
+
+        log.info(
+            "scrape_with_tool_result: %d tool result(s), next_user=%s",
+            len(tool_messages),
+            repr(next_user_msg[:40]) if next_user_msg else "None",
+        )
+
+        # Reuse the same orchestration logic as scrape() but skip the full
+        # retry loop — send directly and return.
+        try:
+            if self.page is None:
+                await self.launch_browser(self.account)
+
+            initial_response_count = await self._count_response_elements()
+            await self.send_prompt(wrapped_prompt, mode="continue")
+
+            from config import DEEPSEEK_CONFIG as _DS_CFG
+            t = _DS_CFG["timeouts"]
+            text = await self.wait_for_response(
+                response_selectors=self._response_selectors(),
+                timeout=t["response_wait"],
+                stability_secs=t["stability_check"],
+                stability_polls=t["stability_polls"],
+                poll_interval=t["poll_interval"],
+                initial_response_count=initial_response_count,
+            )
+
+            ok, cleaned = self._validate_response(text)
+            if not ok:
+                cleaned = self._repair_unescaped_quotes(cleaned)
+                cleaned = self._repair_tool_calls_arguments(cleaned)
+
+            return {
+                "ok":          True,
+                "mode":        "continue",
+                "account":     self.account,
+                "text":        cleaned,
+                "code_blocks": self.extract_code_blocks(cleaned),
+                "timestamp":   datetime.now().astimezone().isoformat(),
+            }
+        except Exception as exc:
+            log.error("scrape_with_tool_result error: %s", exc, exc_info=True)
+            await self.take_debug_screenshot("tool_result_error")
+            return {
+                "ok":        False,
+                "mode":      "continue",
+                "account":   self.account,
+                "error":     str(exc),
+                "timestamp": datetime.now().astimezone().isoformat(),
+            }
 
     # ------------------------------------------------------------------ #
     # Attachments — CDP clipboard inject + Ctrl+V (NOT <input type=file>)
@@ -634,28 +808,48 @@ class DeepSeekScraper(BaseAIChatScraper):
         )
 
     async def is_session_expired(self) -> bool:
-        """Fast check: are we on / showing the login DOM? (no long waits)."""
+        """
+        Fast check: are we on / showing the login DOM?
+
+        FIX: removed 'div:has-text("Log in")' from the login-form selector
+        check. Playwright's :has-text() matches ANY element whose subtree
+        contains the text — so on a logged-in conversation page the sidebar
+        "Log in" link, a referral banner, or any help text would trigger a
+        false positive, causing ensure_authenticated() → login() to navigate
+        away from the conversation URL and break CONTINUE mode.
+
+        Detection order (cheapest → safest):
+          1. URL is the sign-in URL             → definitely expired
+          2. input[type="password"] is VISIBLE  → login form showing
+          3. Chat input present                 → definitely authenticated
+          4. Body contains session-expiry phrase → expired
+        """
         if self.page is None:
             return False
-        # 1) redirected to the sign-in URL (instant).
+
+        # 1) On the sign-in page URL (instant, no DOM query needed).
         if DEEPSEEK_CONFIG["login_url"] in (self.page.url or ""):
             return True
-        # 2) login form present — use query_selector for an INSTANT check
-        #    (no per-selector waiting, so this is cheap to call every request).
-        for sel in _SEL["login_form"]:
-            try:
-                if await self.page.query_selector(sel) is not None:
-                    return True
-            except Exception:
-                continue
-        # 3) the chat input is present -> definitely authenticated.
+
+        # 2) Login form: only check for a VISIBLE password field.
+        #    This is far more specific than :has-text() and will not fire on
+        #    logged-in pages that happen to mention "Log in" somewhere.
+        try:
+            pwd = await self.page.query_selector('input[type="password"]')
+            if pwd is not None and await pwd.is_visible():
+                return True
+        except Exception:
+            pass
+
+        # 3) Chat input present → definitely authenticated (fast exit).
         for sel in _SEL["chat_input"]:
             try:
                 if await self.page.query_selector(sel) is not None:
                     return False
             except Exception:
                 continue
-        # 4) fall back to phrase match in the page body.
+
+        # 4) Phrase match on body text (last resort).
         try:
             body = (await self.page.inner_text("body")).lower()
         except Exception:
@@ -686,6 +880,44 @@ class DeepSeekScraper(BaseAIChatScraper):
             except Exception as exc:  # noqa: BLE001
                 log.warning("Failed reading localStorage sidecar: %s", exc)
         return {}
+
+    # ------------------------------------------------------------------ #
+    # Rotation / restart overrides — reset conversation state
+    # ------------------------------------------------------------------ #
+    async def _rotate_account(self, restart_first: bool = True) -> bool:
+        """
+        Override: reset _conversation_started after rotating.
+
+        After rotation the browser lands on the new account's home page, NOT
+        on the previous conversation URL. If we kept _conversation_started=True,
+        _ensure_page_ready("continue") would skip navigation and the next prompt
+        would be sent to the home page, silently starting a new conversation.
+
+        Mirrors the implicit reset in Qwen: _rotate_account() always calls
+        launch_browser / close/reopen, which navigates to the home page; Qwen's
+        next call to _ensure_page_ready("new") or scrape(mode="new") then calls
+        _goto_new_chat() which resets the flag explicitly.
+        """
+        result = await super()._rotate_account(restart_first=restart_first)
+        if result:
+            self._conversation_started = False
+            log.debug(
+                "_rotate_account: account rotated — _conversation_started reset to False"
+            )
+        return result
+
+    async def restart_browser(self, account=None) -> "Page":
+        """
+        Override: reset _conversation_started on browser restart.
+
+        After a restart the page is fresh (home or about:blank). Keeping the
+        flag True would cause the same wrong-page bug as after rotation.
+        """
+        self._conversation_started = False
+        log.debug(
+            "restart_browser: restarting — _conversation_started reset to False"
+        )
+        return await super().restart_browser(account)
 
     # ------------------------------------------------------------------ #
     # Validation / hooks

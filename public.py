@@ -7,10 +7,11 @@ pre-warmed BrowserPool. Connects to the VPS over WebSocket, receives tasks,
 runs them through the pool, and streams results back. Auto-reconnects.
 
 NEW FEATURES:
-  1. Session persistence (disk) via SessionStore
-  2. CONTINUE: navigate to conversation URL
-  3. Per-session lock (anti-collision CONTINUE)
-  4. preferred_account routing with fallback
+  1. Session persistence (disk) via SessionStore  [upgraded: TTL, account pin,
+     load_from_disk, cleanup_expired, bump_turn]
+  2. CONTINUE: navigate to conversation URL + skip-goto optimisation
+  3. Per-session lock (anti-collision CONTINUE) + lock TTL cleanup
+  4. preferred_account routing — CONTINUE forces same account as Turn 1
   5. Keepalive ping to VPS (anti-disconnect)
   6. update_accounts to VPS when pool ready
   7. Console interactive loop (CLI commands)
@@ -20,6 +21,8 @@ NEW FEATURES:
   11. Stream: true rejection (unsupported)
   12. Attachment via Attachment class (base64)
   13. Auto-reconnect to VPS (enhanced backoff)
+  14. Tool-result injection: scrape_with_tool_result() path for CONTINUE Turn 2
+  15. Background cleanup task (expired sessions + idle locks every 60 s)
 
 Usage
 -----
@@ -41,6 +44,9 @@ import json
 import socket
 import sys
 import threading
+import time
+import uuid
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -49,45 +55,195 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from browser_pool import BrowserPool
-from config import DATA_SESSION_DIR
+from config import DATA_SESSION_DIR, ROTATION_CONFIG
 from scrapers.utils import get_logger
 
 log = get_logger("paf_deepseek.worker")
 
+_SESSION_TTL: int = ROTATION_CONFIG.get("session_ttl", 3600)
+
 
 # =========================================================================== #
-# SessionStore (Disk Persistence)
+# Session dataclass
+# =========================================================================== #
+@dataclass
+class Session:
+    session_id: str
+    account: Optional[str] = None          # account used for Turn 1 → pinned for CONTINUE
+    conversation_url: Optional[str] = None  # URL of the live DeepSeek thread
+    created_at: float = field(default_factory=time.time)
+    last_used: float = field(default_factory=time.time)
+    turn_count: int = 0
+
+    def touch(self) -> None:
+        self.last_used = time.time()
+
+    def is_expired(self, ttl: int) -> bool:
+        return (time.time() - self.last_used) > ttl
+
+
+# =========================================================================== #
+# SessionStore (Disk Persistence) — upgraded from simple key→JSON to
+# full Session objects with TTL, load-from-disk, and cleanup.
 # =========================================================================== #
 class SessionStore:
-    """Persistent session storage for continue mode."""
+    """
+    Persistent session store for CONTINUE mode.
 
-    def __init__(self, storage_dir: Path = DATA_SESSION_DIR) -> None:
+    Each session is a JSON file under dataSession/<session_id>.json.
+    Sessions expire after `ttl` seconds of inactivity and are removed from
+    both memory and disk on next access or explicit cleanup_expired().
+    On startup, load_from_disk() restores all non-expired sessions so that
+    conversations survive a worker restart.
+    """
+
+    def __init__(
+        self,
+        ttl: int = _SESSION_TTL,
+        storage_dir: Path = DATA_SESSION_DIR,
+    ) -> None:
+        self.ttl = ttl
         self.storage_dir = Path(storage_dir)
         self.storage_dir.mkdir(parents=True, exist_ok=True)
+        self._sessions: dict[str, Session] = {}
 
+    # ------------------------------------------------------------------ #
+    # Internal helpers
+    # ------------------------------------------------------------------ #
     def _path(self, session_id: str) -> Path:
         return self.storage_dir / f"{session_id}.json"
 
-    def save(self, session_id: str, data: dict) -> None:
-        try:
-            self._path(session_id).write_text(json.dumps(data, indent=2))
-        except Exception as e:
-            log.warning("Failed to save session %s: %s", session_id, e)
+    def _to_dict(self, s: Session) -> dict:
+        return {
+            "session_id":       s.session_id,
+            "account":          s.account,
+            "conversation_url": s.conversation_url,
+            "created_at":       s.created_at,
+            "last_used":        s.last_used,
+            "turn_count":       s.turn_count,
+        }
 
-    def load(self, session_id: str) -> Optional[dict]:
-        try:
-            p = self._path(session_id)
-            if p.exists():
-                return json.loads(p.read_text())
-        except Exception as e:
-            log.warning("Failed to load session %s: %s", session_id, e)
-        return None
+    def _from_dict(self, d: dict) -> Session:
+        return Session(
+            session_id=d["session_id"],
+            account=d.get("account"),
+            conversation_url=d.get("conversation_url"),
+            created_at=d.get("created_at", time.time()),
+            last_used=d.get("last_used", time.time()),
+            turn_count=d.get("turn_count", 0),
+        )
 
-    def delete(self, session_id: str) -> None:
+    def _save_to_disk(self, s: Session) -> None:
+        try:
+            self._path(s.session_id).write_text(
+                json.dumps(self._to_dict(s), indent=2), encoding="utf-8"
+            )
+        except Exception as exc:
+            log.warning("SessionStore: failed to save %s: %s", s.session_id[:8], exc)
+
+    def _delete_from_disk(self, session_id: str) -> None:
         try:
             self._path(session_id).unlink(missing_ok=True)
-        except Exception as e:
-            log.warning("Failed to delete session %s: %s", session_id, e)
+        except Exception as exc:
+            log.warning("SessionStore: failed to delete %s: %s", session_id[:8], exc)
+
+    # ------------------------------------------------------------------ #
+    # Startup restore
+    # ------------------------------------------------------------------ #
+    def load_from_disk(self) -> int:
+        """
+        Load all non-expired sessions from disk into memory on startup.
+        Expired files are deleted immediately.
+        Returns the number of sessions restored.
+        """
+        restored = 0
+        removed  = 0
+        for path in self.storage_dir.glob("*.json"):
+            try:
+                d = json.loads(path.read_text(encoding="utf-8"))
+                s = self._from_dict(d)
+                if s.is_expired(self.ttl):
+                    path.unlink(missing_ok=True)
+                    removed += 1
+                    continue
+                self._sessions[s.session_id] = s
+                restored += 1
+                log.debug(
+                    "SessionStore: restored %s (account=%s, url=%s, turns=%d)",
+                    s.session_id[:8], s.account,
+                    (s.conversation_url or "")[:60], s.turn_count,
+                )
+            except Exception as exc:
+                log.warning("SessionStore: failed to read %s: %s", path.name, exc)
+        if restored:
+            log.info("SessionStore: restored %d session(s) (%d expired removed)", restored, removed)
+        else:
+            log.debug("SessionStore: no active sessions on disk (%d expired removed)", removed)
+        return restored
+
+    # ------------------------------------------------------------------ #
+    # CRUD
+    # ------------------------------------------------------------------ #
+    def create(
+        self,
+        session_id: Optional[str] = None,
+        account: Optional[str] = None,
+    ) -> Session:
+        sid = session_id or uuid.uuid4().hex
+        s = Session(session_id=sid, account=account)
+        self._sessions[sid] = s
+        self._save_to_disk(s)
+        return s
+
+    def get(self, session_id: str) -> Optional[Session]:
+        """Return the Session, or None if absent / expired (auto-deletes on expiry)."""
+        s = self._sessions.get(session_id)
+        if s is None:
+            return None
+        if s.is_expired(self.ttl):
+            del self._sessions[session_id]
+            self._delete_from_disk(session_id)
+            log.info("SessionStore: session %s expired — deleted", session_id[:8])
+            return None
+        return s
+
+    def get_or_create(
+        self,
+        session_id: Optional[str],
+        account: Optional[str] = None,
+    ) -> Session:
+        if session_id:
+            existing = self.get(session_id)
+            if existing:
+                return existing
+        return self.create(session_id=session_id, account=account)
+
+    def update(self, s: Session) -> None:
+        """Persist an updated Session back to memory and disk."""
+        self._sessions[s.session_id] = s
+        self._save_to_disk(s)
+
+    def bump_turn(self, session_id: str) -> None:
+        s = self.get(session_id)
+        if s:
+            s.turn_count += 1
+            s.touch()
+            self.update(s)
+
+    def all_sessions(self) -> list[Session]:
+        return list(self._sessions.values())
+
+    def cleanup_expired(self) -> int:
+        """Remove all expired sessions from memory and disk. Returns count removed."""
+        expired = [
+            sid for sid, s in self._sessions.items() if s.is_expired(self.ttl)
+        ]
+        for sid in expired:
+            del self._sessions[sid]
+            self._delete_from_disk(sid)
+        if expired:
+            log.debug("SessionStore: cleaned %d expired session(s)", len(expired))
+        return len(expired)
 
 
 # =========================================================================== #
@@ -100,6 +256,7 @@ class LocalWorker:
         token: str,
         num_workers: int,
         headless: bool = True,
+        session_ttl: int = _SESSION_TTL,
     ) -> None:
         self.vps_url = vps_url
         self.token = token
@@ -109,9 +266,16 @@ class LocalWorker:
         self.pool: Optional[BrowserPool] = None
         self._stop = asyncio.Event()
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
-        self.session_store = SessionStore()
-        self._session_locks: dict[str, asyncio.Lock] = {}  # Per-session locks
+        # Session store with TTL; restore non-expired sessions from disk on start.
+        self.session_store = SessionStore(ttl=session_ttl)
+        self.session_store.load_from_disk()
+        # Per-session asyncio.Lock — prevents two concurrent CONTINUE requests
+        # to the same session from colliding.
+        self._session_locks: dict[str, asyncio.Lock] = {}
+        # Timestamps of when each lock was last used (for TTL-based GC).
+        self._session_locks_meta: dict[str, float] = {}
         self._keepalive_task: Optional[asyncio.Task] = None
+        self._cleanup_task: Optional[asyncio.Task] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None  # Main event loop reference
 
     # ------------------------------------------------------------------ #
@@ -174,6 +338,8 @@ class LocalWorker:
 
             # Start keepalive ping
             self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+            # Start background cleanup (expired sessions + idle locks)
+            self._cleanup_task = asyncio.create_task(self._cleanup_loop())
 
             await self._message_loop(ws)
 
@@ -201,6 +367,42 @@ class LocalWorker:
         except Exception:
             pass
 
+    async def _cleanup_loop(self) -> None:
+        """Background task: remove expired sessions and idle locks every 60 s."""
+        try:
+            while not self._stop.is_set():
+                await asyncio.sleep(60)
+                cleaned = self.session_store.cleanup_expired()
+                if cleaned:
+                    log.debug("Cleanup: removed %d expired session(s)", cleaned)
+                await self._cleanup_session_locks()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            log.warning("Cleanup loop error: %s", exc)
+
+    # ------------------------------------------------------------------ #
+    # Per-session lock helpers
+    # ------------------------------------------------------------------ #
+    async def _get_session_lock(self, session_id: str) -> asyncio.Lock:
+        if session_id not in self._session_locks:
+            self._session_locks[session_id] = asyncio.Lock()
+        self._session_locks_meta[session_id] = time.time()
+        return self._session_locks[session_id]
+
+    async def _cleanup_session_locks(self, ttl: float = 3600.0) -> None:
+        """Remove per-session locks that have been idle for `ttl` seconds."""
+        now = time.time()
+        stale = [
+            sid for sid, ts in self._session_locks_meta.items()
+            if now - ts > ttl and not self._session_locks[sid].locked()
+        ]
+        for sid in stale:
+            del self._session_locks[sid]
+            del self._session_locks_meta[sid]
+        if stale:
+            log.debug("Cleaned %d idle session lock(s)", len(stale))
+
     # ------------------------------------------------------------------ #
     # Task Handling
     # ------------------------------------------------------------------ #
@@ -219,11 +421,11 @@ class LocalWorker:
                 )
                 return
 
-            # Feature 3: Per-session lock
+            # Feature 3: Per-session lock (anti-collision for CONTINUE)
             session_id = request.get("session_id")
             mode = request.get("mode", "new")
             if session_id and mode == "continue":
-                lock = self._session_locks.setdefault(session_id, asyncio.Lock())
+                lock = await self._get_session_lock(session_id)
                 async with lock:
                     result = await self._execute_task(request)
             else:
@@ -236,15 +438,23 @@ class LocalWorker:
                 await self._send_error(ws, task_id, error_msg, status=status)
                 return
 
-            # Feature 6: Save session after successful task
-            if session_id and result.get("conversation_url"):
-                self.session_store.save(
-                    session_id,
-                    {
-                        "conversation_url": result["conversation_url"],
-                        "account": result.get("account"),
-                        "updated_at": datetime.now().isoformat(),
-                    },
+            # Feature 6: Persist / update session after a successful task.
+            # Store account so CONTINUE can pin back to the same account.
+            if session_id:
+                conv_url = result.get("conversation_url")
+                account  = result.get("account")
+                s = self.session_store.get_or_create(session_id, account=account)
+                if conv_url:
+                    s.conversation_url = conv_url
+                if account and not s.account:
+                    s.account = account
+                s.touch()
+                self.session_store.update(s)
+                self.session_store.bump_turn(session_id)
+                log.debug(
+                    "Session %s updated: account=%s url=%s turns=%d",
+                    session_id[:8], s.account,
+                    (s.conversation_url or "")[:60], s.turn_count,
                 )
 
             await ws.send(
@@ -267,12 +477,13 @@ class LocalWorker:
             return {"ok": False, "error": "Pool not initialized"}
 
         # Extract request fields
-        prompt = request.get("prompt", "")
-        mode = request.get("mode", "new")
-        session_id = request.get("session_id")
-        model_tab = request.get("model_tab", "instant")
-        deep_think = request.get("deep_think", False)
-        web_search = request.get("web_search", False)
+        prompt      = request.get("prompt", "")
+        mode        = request.get("mode", "new")
+        session_id  = request.get("session_id")
+        model_tab   = request.get("model_tab", "instant")
+        deep_think  = request.get("deep_think", False)
+        web_search  = request.get("web_search", False)
+        tool_msgs   = request.get("tool_messages")       # list[dict] for Turn 2
         preferred_account = request.get("preferred_account")
 
         # Feature 12: Attachment support via base64
@@ -280,45 +491,86 @@ class LocalWorker:
         if request.get("attachments"):
             attachments = []
             for att in request["attachments"]:
-                # Convert to path (base64 decoded to temp file by scraper)
                 attachments.append(
                     {
                         "filename": att.get("filename", "file"),
-                        "data": att.get("data", ""),
+                        "data":     att.get("data", ""),
                         "mime_type": att.get("mime_type", "application/octet-stream"),
                     }
                 )
 
-        # Feature 2: CONTINUE mode - navigate to conversation URL
-        conversation_url = None
+        # Feature 2 + 4 (upgraded): CONTINUE → load session, extract
+        # conversation_url AND the pinned account so we land on the
+        # same browser slot that handled Turn 1.
+        conversation_url: Optional[str] = None
         if mode == "continue" and session_id:
-            session_data = self.session_store.load(session_id)
-            if session_data:
-                conversation_url = session_data.get("conversation_url")
-                log.info("CONTINUE mode: navigating to %s", conversation_url)
+            existing = self.session_store.get(session_id)
+            if existing:
+                conversation_url = existing.conversation_url
+                # Pin to the same account that opened the conversation.
+                if existing.account and not preferred_account:
+                    preferred_account = existing.account
+                log.info(
+                    "CONTINUE session=%s account=%s url=%s",
+                    session_id[:8], preferred_account,
+                    (conversation_url or "")[:80],
+                )
+            else:
+                log.warning(
+                    "CONTINUE requested but session %s not found/expired — "
+                    "falling back to NEW",
+                    session_id[:8],
+                )
+                mode = "new"
 
         # Feature 4: preferred_account routing with fallback
         if preferred_account:
-            # Check if preferred account is available
             available = self.pool.list_accounts()
             if preferred_account not in available:
                 log.warning(
-                    "Preferred account %s not available, using fallback", preferred_account
+                    "Preferred account %s not available, using fallback",
+                    preferred_account,
                 )
                 preferred_account = None
 
         # Run task through pool
         try:
-            result = await self.pool.run_task(
-                prompt=prompt,
-                mode=mode,
-                model_tab=model_tab,
-                deep_think=deep_think,
-                web_search=web_search,
-                attachments=attachments,
-                preferred_account=preferred_account,
-                conversation_url=conversation_url,
-            )
+            # Turn 2 path: tool results → scrape_with_tool_result()
+            if mode == "continue" and tool_msgs:
+                # The caller sends the next user message (if any) after tool results.
+                messages = request.get("messages", [])
+                last_tool_idx = max(
+                    (i for i, m in enumerate(messages) if m.get("role") == "tool"),
+                    default=-1,
+                )
+                msgs_after = messages[last_tool_idx + 1:] if last_tool_idx >= 0 else []
+                next_user = next(
+                    (m["content"] for m in msgs_after
+                     if m.get("role") == "user" and m.get("content")),
+                    None,
+                )
+                log.info(
+                    "CONTINUE Turn 2: %d tool result(s), next_user=%s",
+                    len(tool_msgs),
+                    repr(next_user[:40]) if next_user else "None",
+                )
+                result = await self.pool.run_task_with_tool_result(
+                    tool_messages=tool_msgs,
+                    next_user_msg=next_user,
+                    conversation_url=conversation_url,
+                    preferred_account=preferred_account,
+                )
+            else:
+                result = await self.pool.run_task(
+                    prompt=prompt,
+                    mode=mode,
+                    model_tab=model_tab,
+                    deep_think=deep_think,
+                    web_search=web_search,
+                    attachments=attachments,
+                    preferred_account=preferred_account,
+                    conversation_url=conversation_url,
+                )
             return result
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
@@ -530,8 +782,9 @@ class LocalWorker:
         """Graceful shutdown."""
         print("\n🛑 Shutting down worker...")
         self._stop.set()
-        if self._keepalive_task:
-            self._keepalive_task.cancel()
+        for task in (self._keepalive_task, self._cleanup_task):
+            if task:
+                task.cancel()
         if self._ws:
             await self._ws.close()
         sys.exit(0)
@@ -569,6 +822,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Run browsers with visible UI (overrides --headless)",
     )
+    p.add_argument(
+        "--session-ttl",
+        type=int,
+        default=_SESSION_TTL,
+        help=f"Session TTL in seconds (default: {_SESSION_TTL})",
+    )
     return p.parse_args(argv)
 
 
@@ -577,7 +836,11 @@ async def _amain(argv: list[str]) -> int:
     headless = not args.no_headless if args.no_headless else args.headless
 
     worker = LocalWorker(
-        vps_url=args.vps, token=args.token, num_workers=args.workers, headless=headless
+        vps_url=args.vps,
+        token=args.token,
+        num_workers=args.workers,
+        headless=headless,
+        session_ttl=args.session_ttl,
     )
     try:
         await worker.start()

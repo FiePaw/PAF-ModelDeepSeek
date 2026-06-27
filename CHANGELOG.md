@@ -5,7 +5,220 @@ Format: `[version] YYYY-MM-DD — summary`
 
 ---
 
-## [2.0.5] 2026-06-26 — Update /v1/models response format
+## [2.1.0] 2026-06-27 — Session persistence overhaul, Turn 2 tool-result, CONTINUE mode bug fixes
+
+Rilis ini membawa arsitektur session baru yang sepenuhnya mengadopsi pola
+PAF-ModelQwen, memperbaiki bug sistematis pada CONTINUE mode, dan menambahkan
+Turn 2 (tool-result injection). File `newpublic_BETA.py` dihapus — semua
+fiturnya sudah dilebur ke `public.py` dan `browser_pool.py`.
+
+---
+
+### New Features
+
+#### Session Persistence — `Session` dataclass + `SessionStore` yang di-upgrade (`public.py`)
+
+Sebelumnya `SessionStore` hanya menyimpan JSON mentah tanpa TTL, tanpa restore
+saat startup, dan tanpa account pinning. Kini diganti penuh dengan:
+
+- **`Session` dataclass** — fields: `session_id`, `account`, `conversation_url`,
+  `created_at`, `last_used`, `turn_count`
+- **TTL-aware `get()`** — auto-hapus session expired dari memory + disk
+- **`load_from_disk()`** — restore semua session non-expired saat startup
+  (conversation bisa dilanjutkan setelah worker restart)
+- **`cleanup_expired()`** — background pruning memory + disk
+- **`bump_turn()`** — increment `turn_count` setiap turn berhasil
+- **`get_or_create()`** dan **`update()`** — upsert atomic dengan persist ke disk
+- **Account pinning** — `Session.account` disimpan → CONTINUE selalu diarahkan
+  ke account yang sama dengan Turn 1
+
+#### Background cleanup loop (`public.py`)
+
+- `LocalWorker._cleanup_loop()` — asyncio task berjalan setiap 60 detik,
+  memanggil `SessionStore.cleanup_expired()` dan `_cleanup_session_locks()`
+- `_session_locks_meta` — timestamp per-lock; lock idle >1 jam di-GC otomatis
+- `--session-ttl` CLI flag — konfigurasi TTL session (default: 3600 detik)
+
+#### Turn 2 — Tool-result injection
+
+CONTINUE mode kini mendukung multi-turn dengan tool calls:
+
+**`scrapers/deepseek_scraper.py` — `scrape_with_tool_result()`**
+
+Membangun prompt terstruktur dan mengirimnya ke thread yang sedang berjalan:
+```
+[TOOL RESULT]
+{"tool_call_id": "c1", "name": "write_file", "result": "done"}
+
+[USER REQUEST]        ← opsional (next_user_msg)
+{"prompt": "sekarang jalankan"}
+```
+
+**`browser_pool.py` — `run_task_with_tool_result()`**
+
+Mengambil slot dengan account yang sama (pinned), re-navigasi ke conversation
+URL jika perlu, lalu memanggil `scrape_with_tool_result()`. Selalu release
+dengan `reset=False` untuk menjaga page tetap hidup.
+
+**`public.py` — `_execute_task()`**
+
+Mendeteksi `tool_messages` dalam payload → routing ke
+`pool.run_task_with_tool_result()` instead of `pool.run_task()`.
+
+#### `BrowserPool` — skip-goto optimisation + `release(reset=)` (`browser_pool.py`)
+
+- **`acquire_pinned(slot_index)`** — ambil slot spesifik berdasarkan index
+  (untuk CONTINUE pinning); fallback ke idle slot jika tidak tersedia
+- **`release(slot, reset=True)`** — `reset=False` pada CONTINUE: page tetap
+  hidup di URL conversation, siap untuk turn berikutnya tanpa reload
+- **Skip-goto optimisation** di `run_task()`: bandingkan `page.url` dengan
+  `conversation_url`; jika sudah sama, set `_conversation_started=True` dan
+  skip `page.goto()` (hemat 2–6 detik)
+- Navigation diganti dari `networkidle` ke `domcontentloaded + asyncio.sleep(2)`
+  — lebih reliable untuk SPA DeepSeek yang tidak pernah benar-benar mencapai
+  `networkidle`
+- `conversation_url` di-attach otomatis ke result dict setelah setiap turn
+
+#### `_ensure_page_ready()` — single navigation gate (`scrapers/deepseek_scraper.py`)
+
+Mengadopsi pola PAF-ModelQwen secara penuh:
+
+```python
+async def _ensure_page_ready(self, mode: str) -> None:
+    if mode == "new" or not self._conversation_started:
+        await self._goto_new_chat()   # NEW → fresh thread
+    else:
+        # CONTINUE → URL sanity check (lihat Bug Fixes)
+        if base_url not in page.url:
+            await self._goto_new_chat()  # fallback jika page drift
+```
+
+- `_conversation_started: bool` — flag instance baru di `__init__`
+- `_goto_new_chat()` selalu reset `_conversation_started = False`
+- `send_prompt()` menjadikan `_ensure_page_ready()` sebagai **satu-satunya**
+  navigation entry point
+
+#### `scrape_with_tool_result()` — Turn 2 pada standalone scraper (`scrapers/deepseek_scraper.py`)
+
+Dapat dipakai langsung dari `main.py` atau `chat.py` tanpa melalui pool/worker.
+
+#### CLI session persistence (`main.py`)
+
+`--mode continue` sebelumnya tidak menyimpan atau memuat conversation URL —
+setiap run selalu membuka chat baru meskipun mode "continue".
+
+- **`_save_cli_session(session_id, url, account)`** — simpan ke
+  `dataSession/cli_<id>.json` setelah setiap run berhasil
+- **`_load_cli_session(session_id)`** — muat URL + account sebelum scraping
+- **`--session-id`** — nama sesi CLI (default: `"cli"`)
+- Account pinning: CONTINUE menggunakan account yang sama dengan turn pertama
+- Skip-goto optimisation: jika browser sudah di conversation URL, skip `goto()`
+
+#### `examples/chat.py` — Interactive chat client via HTTP API (file baru)
+
+Client interaktif multi-turn yang memanggil `/v1/chat/completions` langsung.
+Tidak ada dependency ke modul internal — hanya butuh `requests`.
+
+```bash
+python examples/chat.py
+python examples/chat.py --session-id riset-1
+python examples/chat.py --think-mode thinking
+python examples/chat.py --base-url http://192.168.1.10:9000
+```
+
+Fitur:
+- Auto-manage `mode`: turn 1 → `"new"`, turn 2+ → `"continue"`
+- Health check saat startup
+- Commands: `/new [id]`, `/status`, `/think <mode>`, `/help`, `/quit`
+- Prompt indicator: `●` = sedang dalam thread, `○` = belum mulai
+
+---
+
+### Bug Fixes
+
+#### CONTINUE mode: prompt dikirim ke halaman baru alih-alih melanjutkan thread
+
+**Root cause (5 lapisan — ditemukan dari analisis mendalam PAF-ModelQwen):**
+
+| # | Lokasi | Masalah |
+|---|--------|---------|
+| 1 | `send_prompt()` | `_ensure_loaded()` dipanggil → `ensure_authenticated()` → `login()` → `page.goto(login_url)` — page pindah dari conversation URL sebelum `_ensure_page_ready()` sempat menjaga |
+| 2 | `is_session_expired()` | Selector `div:has-text("Log in")` mencocokkan **semua** elemen yang mengandung teks "Log in" di subtree-nya — termasuk tombol sidebar, referral banner, dsb. di conversation page → false positive sistematis |
+| 3 | `_ensure_page_ready()` | Tidak ada URL sanity check: jika `_conversation_started=True` tapi page sudah drift ke URL lain, navigation dilewati dan prompt dikirim ke halaman yang salah |
+| 4 | `_rotate_account()` | Tidak mereset `_conversation_started` → setelah rotasi, browser di home page akun baru tapi flag masih `True` → `_ensure_page_ready("continue")` skip goto → prompt ke home page |
+| 5 | `restart_browser()` | Sama dengan #4: `_conversation_started` tidak direset setelah restart |
+
+**Fixes (`scrapers/deepseek_scraper.py`):**
+
+- **Fix 1** — Hapus `_ensure_loaded()` dari `send_prompt()`. Sesuai arsitektur
+  Qwen: `send_prompt()` tidak pernah melakukan auth check. Auth sudah ditangani
+  oleh `base_scraper.scrape()` dan `ChatClient.launch()`.
+
+- **Fix 2** — `is_session_expired()` diperketat:
+
+  ```python
+  # SEBELUM (false positive):
+  for sel in _SEL["login_form"]:   # termasuk 'div:has-text("Log in")'
+      if await page.query_selector(sel): return True
+
+  # SESUDAH (spesifik):
+  pwd = await page.query_selector('input[type="password"]')
+  if pwd and await pwd.is_visible(): return True   # hanya login form nyata
+  ```
+
+- **Fix 3** — `_ensure_page_ready()` CONTINUE path kini memverifikasi URL:
+  jika `base_url` tidak ada di `page.url` → fallback ke `_goto_new_chat()`
+
+- **Fix 4 & 5** — Override `_rotate_account()` dan `restart_browser()` di
+  `DeepSeekScraper` untuk reset `_conversation_started = False`:
+
+  ```python
+  async def _rotate_account(self, restart_first=True) -> bool:
+      result = await super()._rotate_account(restart_first)
+      if result:
+          self._conversation_started = False   # ← baru
+      return result
+  ```
+
+**Fix tambahan (`chat.py`):**
+
+- `ChatClient.send()` kini memverifikasi URL sebelum setiap CONTINUE turn —
+  mirror dari skip-goto optimisation Qwen di `public.py`:
+
+  ```python
+  if _conversation_started and session.conversation_url:
+      already_there = conv_url in page.url or page.url in conv_url
+      if not already_there:
+          await page.goto(conv_url)   # re-navigate jika drift
+          _conversation_started = True
+  ```
+
+---
+
+### Removed
+
+- **`newpublic_BETA.py`** — Dihapus. Semua fiturnya (`auto_continue`,
+  slot pinning, `bump_turn`, `load_from_disk`) sudah dilebur ke `public.py`
+  dan `browser_pool.py`.
+
+---
+
+### Files Changed
+
+| File | Perubahan |
+|------|-----------|
+| `config.py` | Tambah `session_ttl: 3600` ke `ROTATION_CONFIG` |
+| `public.py` | `Session` dataclass; `SessionStore` TTL/disk/bump_turn/account-pin; `LocalWorker` cleanup loop, lock GC, `--session-ttl`, Turn 2 dispatch |
+| `browser_pool.py` | `acquire_pinned()`, `release(reset=)`, `run_task_with_tool_result()`, skip-goto, domcontentloaded nav, auto-attach `conversation_url` |
+| `scrapers/deepseek_scraper.py` | `_conversation_started` flag; `_ensure_page_ready()`; `_goto_new_chat()` reset; `send_prompt()` tanpa `_ensure_loaded()`; `scrape_with_tool_result()`; fix `is_session_expired()`; override `_rotate_account()` + `restart_browser()` |
+| `main.py` | `_save_cli_session()`, `_load_cli_session()`, `--session-id`, account pinning, skip-goto untuk `--mode continue` |
+| `examples/chat.py` | **Baru** — interactive chat client via HTTP API |
+| `newpublic_BETA.py` | **Dihapus** |
+| `CHANGELOG.md` | Entri ini |
+
+---
+
+
 
 ### Changes
 
@@ -202,17 +415,31 @@ siblings have fewer. Robust to minified class name changes.
 
 ### Version comparison
 
-| Feature | v2.0.2 | v2.0.3 | v2.0.4 | v2.0.5 |
-|---------|--------|--------|--------|--------|
-| Tab selection | `:has-text >> nth=0` (broken) | `:text-is()` + fallbacks | — | — |
-| Tool matrix | TODO placeholder | Confirmed matrix | — | — |
-| `think_mode` aliases | Incomplete, "search" wrong | All aliases correct | — | — |
-| Send button selector | `_7436101` (stale hash) | — | Stable `ds-button--` classes | — |
-| CONTINUE mode response | Returns old response | — | Anchored to post-send count | — |
-| CONTINUE mode DOM calls | Mode/tool selectors called | — | Skipped (controls hidden) | — |
-| `/v1/models` `owned_by` | `"deepseek"` | — | — | `"PAF-ai"` |
-| `/v1/models` fields | Full OpenAI schema | — | — | Minimal `id/object/owned_by` |
-| `/v1/models` data source | `MODEL_ALIASES.keys()` | — | — | `list_all_accounts()` |
+| Feature | v2.0.2 | v2.0.3 | v2.0.4 | v2.0.5 | v2.1.0 |
+|---------|--------|--------|--------|--------|--------|
+| Tab selection | `:has-text >> nth=0` (broken) | `:text-is()` + fallbacks | — | — | — |
+| Tool matrix | TODO placeholder | Confirmed matrix | — | — | — |
+| `think_mode` aliases | Incomplete, "search" wrong | All aliases correct | — | — | — |
+| Send button selector | `_7436101` (stale hash) | — | Stable `ds-button--` classes | — | — |
+| CONTINUE mode response | Returns old response | — | Anchored to post-send count | — | — |
+| CONTINUE mode DOM calls | Mode/tool selectors called | — | Skipped (controls hidden) | — | — |
+| `/v1/models` `owned_by` | `"deepseek"` | — | — | `"PAF-ai"` | — |
+| `/v1/models` fields | Full OpenAI schema | — | — | Minimal `id/object/owned_by` | — |
+| `/v1/models` data source | `MODEL_ALIASES.keys()` | — | — | `list_all_accounts()` | — |
+| Session TTL | ❌ | — | — | — | ✅ 3600s, configurable |
+| Session disk restore | ❌ | — | — | — | ✅ `load_from_disk()` |
+| Account pinning (CONTINUE) | ❌ | — | — | — | ✅ `Session.account` |
+| Turn 2 tool-result | ❌ | — | — | — | ✅ `scrape_with_tool_result()` |
+| CONTINUE bug: prompt ke new chat | ❌ Bug | — | — | — | ✅ Fixed (5 root causes) |
+| `_ensure_page_ready()` URL check | ❌ | — | — | — | ✅ Sanity check + fallback |
+| `is_session_expired()` false positive | ❌ `:has-text("Log in")` | — | — | — | ✅ `input[type=password]` visible |
+| `_rotate_account()` reset flag | ❌ | — | — | — | ✅ Reset `_conversation_started` |
+| Background cleanup loop | ❌ | — | — | — | ✅ Setiap 60 detik |
+| Skip-goto optimisation | ❌ | — | — | — | ✅ URL compare sebelum goto |
+| `pool.release(reset=)` | ❌ | — | — | — | ✅ CONTINUE jaga page hidup |
+| CLI `--mode continue` | ❌ Selalu buka chat baru | — | — | — | ✅ Simpan + muat URL |
+| `examples/chat.py` | ❌ | — | — | — | ✅ Interactive API client |
+| `newpublic_BETA.py` | ✅ Ada | — | — | — | 🗑️ Dihapus |
 
 ---
 

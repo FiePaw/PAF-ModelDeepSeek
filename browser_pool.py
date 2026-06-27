@@ -196,40 +196,112 @@ class BrowserPool:
         """Acquire any idle slot."""
         return await self._acquire_with_account(timeout=timeout, preferred_account=None)
 
+    async def acquire_pinned(
+        self, slot_index: int, timeout: float = 120.0
+    ) -> BrowserSlot:
+        """
+        Acquire a SPECIFIC slot by index.
+        Used by CONTINUE mode to guarantee the same browser slot (and therefore
+        the same persistent-profile session) as the original Turn 1.
+        Falls back to any idle slot if the pinned slot is unavailable.
+        """
+        deadline = asyncio.get_event_loop().time() + timeout
+        if 0 <= slot_index < len(self.slots):
+            target = self.slots[slot_index]
+            while asyncio.get_event_loop().time() < deadline:
+                if target.status == SlotStatus.IDLE:
+                    async with target._lock:
+                        if target.status == SlotStatus.IDLE:
+                            target.mark_busy()
+                            return target
+                self._idle_event.clear()
+                try:
+                    remaining = deadline - asyncio.get_event_loop().time()
+                    if remaining <= 0:
+                        break
+                    await asyncio.wait_for(
+                        self._idle_event.wait(), timeout=min(remaining, 1.0)
+                    )
+                except asyncio.TimeoutError:
+                    continue
+            log.warning(
+                "Pinned slot %d unavailable after %.0fs; falling back to any idle slot",
+                slot_index, timeout,
+            )
+        return await self._acquire_with_account(timeout=timeout, preferred_account=None)
+
+    async def release(self, slot: BrowserSlot, reset: bool = True) -> None:
+        """
+        Release a slot back to the pool.
+
+        Args:
+            reset: When True (NEW mode) the slot goes back to IDLE so the next
+                   request can reuse it freely.  When False (CONTINUE mode) the
+                   browser page stays alive in its current conversation thread,
+                   ready for the next turn without a page.goto().
+        """
+        if slot.status == SlotStatus.BUSY:
+            slot.mark_idle()
+        self._refresh_idle_event()
+
     async def _acquire_with_account(
         self, timeout: float = 120.0, preferred_account: Optional[str] = None
     ) -> BrowserSlot:
         """
         Acquire a slot, optionally filtering by account.
-        
+
         Args:
-            preferred_account: If specified, wait for slot with this account.
+            preferred_account: If specified, prefer a slot with this account.
+                               If none is available, fall back to any idle slot.
         """
         deadline = asyncio.get_event_loop().time() + timeout
-        while asyncio.get_event_loop().time() < deadline:
+
+        # --- First pass: honour preferred_account -----------------------
+        if preferred_account:
+            while asyncio.get_event_loop().time() < deadline:
+                for slot in self.slots:
+                    if slot.status != SlotStatus.IDLE:
+                        continue
+                    if slot.account != preferred_account:
+                        continue
+                    async with slot._lock:
+                        if slot.status == SlotStatus.IDLE:
+                            slot.mark_busy()
+                            return slot
+                self._idle_event.clear()
+                try:
+                    remaining = deadline - asyncio.get_event_loop().time()
+                    if remaining <= 0:
+                        break
+                    await asyncio.wait_for(self._idle_event.wait(), timeout=min(remaining, 1.0))
+                except asyncio.TimeoutError:
+                    continue
+            # preferred account unavailable — fall through to any-slot
+            log.warning(
+                "No idle slot for preferred_account=%s; using any idle slot",
+                preferred_account,
+            )
+
+        # --- Second pass: any idle slot ---------------------------------
+        deadline2 = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline2:
             for slot in self.slots:
                 if slot.status != SlotStatus.IDLE:
-                    continue
-                # Filter by account if specified
-                if preferred_account and slot.account != preferred_account:
                     continue
                 async with slot._lock:
                     if slot.status == SlotStatus.IDLE:
                         slot.mark_busy()
                         return slot
-            # Wait for any slot to become idle
             self._idle_event.clear()
             try:
-                remaining = deadline - asyncio.get_event_loop().time()
+                remaining = deadline2 - asyncio.get_event_loop().time()
                 if remaining <= 0:
                     break
                 await asyncio.wait_for(self._idle_event.wait(), timeout=min(remaining, 1.0))
             except asyncio.TimeoutError:
                 continue
 
-        # Timeout
-        account_msg = f" with account {preferred_account}" if preferred_account else ""
-        raise TimeoutError(f"No idle slot{account_msg} within {timeout}s")
+        raise TimeoutError(f"No idle slot within {timeout}s")
 
     def _refresh_idle_event(self) -> None:
         """Signal that at least one slot is idle."""
@@ -251,29 +323,57 @@ class BrowserPool:
     ) -> dict:
         """
         Run a single task (scrape). Acquires slot, runs scrape(), releases.
-        
-        NEW FEATURES:
-          - preferred_account: wait for slot with this account
-          - conversation_url: navigate to URL before scrape (CONTINUE mode)
+
+        Features:
+          - preferred_account: acquire slot with this account (CONTINUE pinning)
+          - conversation_url:  navigate to saved URL before scrape (CONTINUE mode)
+            • Skip-goto optimisation: if the browser is already on that URL,
+              marks _conversation_started=True and skips page.goto() entirely.
+          - reset: CONTINUE turns leave the page alive (reset=False on release)
         """
         slot = await self._acquire_with_account(
             timeout=acquire_timeout, preferred_account=preferred_account
         )
         try:
-            # Navigate to conversation URL if provided (CONTINUE mode)
+            # CONTINUE navigation ----------------------------------------
             if conversation_url and slot.scraper and slot.scraper.page:
-                log.info("CONTINUE: navigating to %s", conversation_url)
-                try:
-                    await slot.scraper.page.goto(
-                        conversation_url, wait_until="networkidle", timeout=10000
+                current_url = slot.scraper.page.url or ""
+                # Skip-goto optimisation: already on that URL → no reload needed.
+                already_there = (
+                    conversation_url in current_url
+                    or current_url in conversation_url
+                )
+                if already_there:
+                    log.info(
+                        "Skip goto() — slot %d already at conversation URL", slot.index
                     )
-                    await asyncio.sleep(1)  # Let page settle
-                except Exception as nav_exc:
-                    log.warning("Failed to navigate to conversation URL: %s", nav_exc)
+                    # Signal scraper that a conversation is already in progress.
+                    slot.scraper._conversation_started = True
+                else:
+                    log.info(
+                        "CONTINUE: navigating slot %d to %s", slot.index, conversation_url
+                    )
+                    try:
+                        await slot.scraper.page.goto(
+                            conversation_url,
+                            wait_until="domcontentloaded",
+                            timeout=30_000,
+                        )
+                        await asyncio.sleep(2)  # Let SPA settle after navigation
+                        slot.scraper._conversation_started = True
+                    except Exception as nav_exc:
+                        log.warning(
+                            "Failed to navigate to conversation URL: %s — "
+                            "proceeding without navigation",
+                            nav_exc,
+                        )
 
             result = await slot.scraper.scrape(
                 prompt, mode=mode, attachments=attachments, **send_kwargs
             )
+            # Attach the current page URL so public.py can persist it in the session.
+            if result.get("ok") and slot.scraper and slot.scraper.page:
+                result.setdefault("conversation_url", slot.scraper.page.url)
             return result
         except Exception as exc:
             log.error("run_task failed on slot %d: %s", slot.index, exc, exc_info=True)
@@ -281,9 +381,75 @@ class BrowserPool:
             self._schedule_respawn(slot)
             return {"ok": False, "error": str(exc)}
         finally:
-            if slot.status == SlotStatus.BUSY:
-                slot.mark_idle()
-            self._refresh_idle_event()
+            # CONTINUE: keep page alive (reset=False).
+            # NEW: standard idle release (reset=True, default behaviour).
+            reset = (mode != "continue")
+            await self.release(slot, reset=reset)
+
+    async def run_task_with_tool_result(
+        self,
+        tool_messages: list[dict],
+        next_user_msg: Optional[str] = None,
+        conversation_url: Optional[str] = None,
+        preferred_account: Optional[str] = None,
+        acquire_timeout: float = 120.0,
+    ) -> dict:
+        """
+        Turn 2: inject tool results into an existing CONTINUE conversation.
+
+        Acquires the same account slot used for Turn 1, optionally navigates
+        back to the conversation URL, then calls
+        scraper.scrape_with_tool_result() which builds the structured
+        [TOOL RESULT] / [USER REQUEST] prompt and sends it.
+        """
+        slot = await self._acquire_with_account(
+            timeout=acquire_timeout, preferred_account=preferred_account
+        )
+        try:
+            if conversation_url and slot.scraper and slot.scraper.page:
+                current_url = slot.scraper.page.url or ""
+                already_there = (
+                    conversation_url in current_url
+                    or current_url in conversation_url
+                )
+                if already_there:
+                    log.info(
+                        "Tool Turn 2: skip goto() — slot %d already at URL", slot.index
+                    )
+                    slot.scraper._conversation_started = True
+                else:
+                    log.info(
+                        "Tool Turn 2: navigating slot %d to %s",
+                        slot.index, conversation_url,
+                    )
+                    try:
+                        await slot.scraper.page.goto(
+                            conversation_url,
+                            wait_until="domcontentloaded",
+                            timeout=30_000,
+                        )
+                        await asyncio.sleep(2)
+                        slot.scraper._conversation_started = True
+                    except Exception as nav_exc:
+                        log.warning("Tool Turn 2 nav failed: %s", nav_exc)
+
+            result = await slot.scraper.scrape_with_tool_result(
+                tool_messages=tool_messages,
+                next_user_msg=next_user_msg,
+            )
+            if result.get("ok") and slot.scraper and slot.scraper.page:
+                result.setdefault("conversation_url", slot.scraper.page.url)
+            return result
+        except Exception as exc:
+            log.error(
+                "run_task_with_tool_result failed on slot %d: %s",
+                slot.index, exc, exc_info=True,
+            )
+            slot.mark_dead()
+            self._schedule_respawn(slot)
+            return {"ok": False, "error": str(exc)}
+        finally:
+            await self.release(slot, reset=False)  # always keep page alive after Turn 2
 
     # ------------------------------------------------------------------ #
     # Status
