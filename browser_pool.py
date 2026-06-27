@@ -308,6 +308,48 @@ class BrowserPool:
         if any(s.status == SlotStatus.IDLE for s in self.slots):
             self._idle_event.set()
 
+    async def _wait_for_spa_ready(
+        self,
+        scraper: "DeepSeekScraper",
+        timeout_ms: int = 10_000,
+    ) -> None:
+        """
+        Wait for the DeepSeek React SPA to finish hydrating after a page.goto().
+
+        FIX (Bug #3): After domcontentloaded the SPA still needs to hydrate
+        and render existing message history. If _count_response_elements() is
+        called before hydration completes it returns 0 (or a lower number than
+        the actual message count), causing skip_count to be wrong and
+        wait_for_response to either immediately return a stale old response or
+        loop forever.
+
+        Strategy (ordered cheapest → most reliable):
+          1. Wait for the chat input to be attached — confirms the SPA shell has
+             rendered enough to accept a new prompt. This is a fast, low-cost
+             check that reliably gates on SPA readiness.
+          2. If the chat input is not found within timeout_ms, log a warning and
+             continue anyway — better to proceed with a possibly stale count than
+             to hang indefinitely.
+        """
+        if scraper.page is None:
+            return
+        from config import DEEPSEEK_CONFIG
+        chat_selectors = DEEPSEEK_CONFIG["selectors"].get("chat_input", [])
+        for sel in chat_selectors:
+            try:
+                await scraper.page.locator(sel).first.wait_for(
+                    state="attached", timeout=timeout_ms
+                )
+                log.debug("_wait_for_spa_ready: chat input attached (%s)", sel)
+                return
+            except Exception:
+                continue
+        log.warning(
+            "_wait_for_spa_ready: chat input not found within %dms — "
+            "proceeding with possibly incomplete DOM",
+            timeout_ms,
+        )
+
     # ------------------------------------------------------------------ #
     # Enhanced run_task with routing & navigation
     # ------------------------------------------------------------------ #
@@ -330,6 +372,10 @@ class BrowserPool:
             • Skip-goto optimisation: if the browser is already on that URL,
               marks _conversation_started=True and skips page.goto() entirely.
           - reset: CONTINUE turns leave the page alive (reset=False on release)
+
+        FIX (Bug #3): Navigation (goto + SPA-ready wait) now happens BEFORE
+        scrape() is called. scrape() → _count_response_elements() therefore
+        sees the fully hydrated DOM, and the skip_count baseline is correct.
         """
         slot = await self._acquire_with_account(
             timeout=acquire_timeout, preferred_account=preferred_account
@@ -359,7 +405,13 @@ class BrowserPool:
                             wait_until="domcontentloaded",
                             timeout=30_000,
                         )
-                        await asyncio.sleep(2)  # Let SPA settle after navigation
+                        # FIX (Bug #3): Replace blind sleep(2) with a
+                        # deterministic SPA-ready check. Wait for the chat
+                        # input to be attached, confirming the React app has
+                        # hydrated and rendered existing message history.
+                        # This ensures _count_response_elements() (called
+                        # inside scrape()) sees the correct baseline count.
+                        await self._wait_for_spa_ready(slot.scraper, timeout_ms=10_000)
                         slot.scraper._conversation_started = True
                     except Exception as nav_exc:
                         log.warning(
@@ -401,6 +453,10 @@ class BrowserPool:
         back to the conversation URL, then calls
         scraper.scrape_with_tool_result() which builds the structured
         [TOOL RESULT] / [USER REQUEST] prompt and sends it.
+
+        FIX (Bug #3): Same as run_task — sleep(2) replaced with
+        _wait_for_spa_ready() so _count_response_elements() inside
+        scrape_with_tool_result() sees the correct baseline element count.
         """
         slot = await self._acquire_with_account(
             timeout=acquire_timeout, preferred_account=preferred_account
@@ -428,7 +484,8 @@ class BrowserPool:
                             wait_until="domcontentloaded",
                             timeout=30_000,
                         )
-                        await asyncio.sleep(2)
+                        # FIX (Bug #3): deterministic SPA-ready wait instead of sleep(2).
+                        await self._wait_for_spa_ready(slot.scraper, timeout_ms=10_000)
                         slot.scraper._conversation_started = True
                     except Exception as nav_exc:
                         log.warning("Tool Turn 2 nav failed: %s", nav_exc)

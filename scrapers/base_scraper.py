@@ -332,6 +332,30 @@ class BaseAIChatScraper(ABC):
                 continue
         return 0
 
+    async def _is_stop_button_present(self) -> bool:
+        """
+        Return True if the stop-generation button is currently visible on the page.
+
+        Used by wait_for_response() as the primary "still streaming" signal.
+        The stop button appears as soon as DeepSeek starts streaming and is
+        removed from the DOM when generation finishes — more reliable than
+        waiting for text content to stabilise, because DeepSeek may re-render
+        (syntax highlighting, math) AFTER streaming ends, which causes
+        stability-only polling to keep resetting.
+        """
+        if self.page is None:
+            return False
+        from config import DEEPSEEK_CONFIG  # keep base import-light
+        stop_selectors = DEEPSEEK_CONFIG["selectors"].get("stop_button", [])
+        for sel in stop_selectors:
+            try:
+                loc = self.page.locator(sel)
+                if await loc.count() > 0 and await loc.first.is_visible():
+                    return True
+            except Exception:
+                continue
+        return False
+
     async def wait_for_response(
         self,
         response_selectors: list[str],
@@ -342,23 +366,77 @@ class BaseAIChatScraper(ABC):
         initial_response_count: int = 0,
     ) -> str:
         """
-        Wait until the AI response stops changing. The response is considered
-        complete when its text is non-empty AND unchanged for `stability_polls`
-        consecutive polls. More robust than waiting for a loading indicator.
+        Wait until the AI response is complete and stable.
+
+        FIX (Bug #2): Two-phase strategy that avoids the re-render reset problem.
+
+        Phase 1 — "Stop button gone" (primary signal):
+            Poll until the stop-generation button disappears from the DOM.
+            This is the most reliable indicator that DeepSeek has finished
+            streaming — the button is shown during generation and removed on
+            completion. Avoids the stability-counter being reset by post-stream
+            re-renders (syntax highlighting, math, etc.).
+
+            If the stop button was never detected in the first 10 % of the
+            timeout (i.e. it might not exist / selector mismatch), we fall
+            through to Phase 2 immediately so we don't hang forever.
+
+        Phase 2 — "Stable text" (confirmation / fallback):
+            Once the stop button is gone (or was never seen), require the
+            response text to be non-empty AND unchanged for `stability_polls`
+            consecutive polls. This acts as a safety net for cases where the
+            stop button selector has drifted.
 
         Args:
-            initial_response_count: Number of assistant response elements that
-                existed on the page BEFORE the prompt was sent (snapshot taken
-                by _count_response_elements()). In CONTINUE mode the page
-                already has N old responses — we must wait until count > N
-                before reading, otherwise we immediately read an old stable
-                response and return it as if it were the new one.
-                Defaults to 0 (NEW mode: no prior responses on page).
+            initial_response_count: Baseline element count taken BEFORE the
+                prompt was sent (see _count_response_elements). Elements at
+                index < initial_response_count are old responses (CONTINUE mode)
+                and must be skipped. Default 0 for NEW mode.
         """
         deadline = time.monotonic() + timeout
         last_text = ""
         stable_count = 0
 
+        # ------------------------------------------------------------------ #
+        # Phase 1: wait for the stop button to appear, then disappear.
+        # ------------------------------------------------------------------ #
+        # Grace window: give DeepSeek time to show the stop button before we
+        # decide it was never present. 10 % of total timeout, capped at 15 s.
+        grace_deadline = time.monotonic() + min(timeout * 0.10, 15.0)
+        stop_seen = False
+
+        while time.monotonic() < deadline:
+            if await self._is_stop_button_present():
+                stop_seen = True
+                log.debug("wait_for_response: stop button detected — streaming in progress")
+                break
+            # Stop button not yet visible.
+            if time.monotonic() >= grace_deadline:
+                # It didn't appear within the grace window — selector may have
+                # drifted. Fall through to stability-only Phase 2.
+                log.debug(
+                    "wait_for_response: stop button not seen within grace window "
+                    "(%.0fs) — falling back to stability-only mode",
+                    min(timeout * 0.10, 15.0),
+                )
+                break
+            await asyncio.sleep(poll_interval)
+
+        if stop_seen:
+            # Button appeared — now wait until it's gone (generation finished).
+            log.debug("wait_for_response: waiting for stop button to disappear")
+            while time.monotonic() < deadline:
+                if not await self._is_stop_button_present():
+                    log.debug("wait_for_response: stop button gone — generation complete")
+                    break
+                await asyncio.sleep(poll_interval)
+            # Small settle sleep so any post-stream DOM mutations (syntax
+            # highlighting, math rendering) can complete before we read text.
+            await asyncio.sleep(min(poll_interval, 0.5))
+
+        # ------------------------------------------------------------------ #
+        # Phase 2: confirm with stability polling (also the fallback path).
+        # ------------------------------------------------------------------ #
         while time.monotonic() < deadline:
             text = await self._read_latest_response(
                 response_selectors,
@@ -367,6 +445,10 @@ class BaseAIChatScraper(ABC):
             if text and text == last_text:
                 stable_count += 1
                 if stable_count >= stability_polls:
+                    log.debug(
+                        "wait_for_response: stable after %d polls (stop_seen=%s)",
+                        stable_count, stop_seen,
+                    )
                     return text
             else:
                 stable_count = 0

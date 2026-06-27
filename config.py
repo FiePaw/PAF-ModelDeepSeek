@@ -163,9 +163,27 @@ DEEPSEEK_CONFIG: dict = {
             "div[class*='markdown']",
         ],
         # The latest assistant message specifically (last response bubble).
+        #
+        # FIX (Bug #1): Extended with robust structural + role-based fallbacks that
+        # survive DeepSeek React SPA class-name churn. Ordered from most-specific
+        # to most-permissive so the scraper latches onto the tightest match first.
+        #
+        # Selector rationale:
+        #   1. div.ds-markdown:last-of-type         — original, most precise
+        #   2. div[class*='ds-markdown']:last-of-type — partial-class variant
+        #   3. [data-role='assistant'] .ds-markdown  — role-attribute anchor (stable if present)
+        #   4. [data-role='assistant']:last-of-type  — role-only, no class dependency
+        #   5. div[class*='markdown']:last-of-type   — broadest class fragment
+        #   6. .dad65929:last-of-type               — confirmed minified wrapper (June 2026)
+        #   7. div[class*='_message']:last-of-type   — generic message bubble fallback
         "assistant_message": [
             "div.ds-markdown:last-of-type",
             "div[class*='ds-markdown']:last-of-type",
+            "[data-role='assistant'] div.ds-markdown",
+            "[data-role='assistant']:last-of-type",
+            "div[class*='markdown']:last-of-type",
+            ".dad65929:last-of-type",
+            "div[class*='_message']:last-of-type",
         ],
         # "Typing"/generation in-progress indicator. TODO: verify.
         "loading_indicator": [
@@ -173,10 +191,28 @@ DEEPSEEK_CONFIG: dict = {
             "div[class*='_typing']",
             "svg[class*='spin']",
         ],
-        # Stop-generation button shown while streaming. TODO: verify.
+        # Stop-generation button shown while streaming.
+        #
+        # FIX (Bug #2): Extended with selectors that target the square-stop icon
+        # DeepSeek renders during active streaming. The button disappears when
+        # generation finishes — wait_for_response uses its absence as the primary
+        # "done" signal (more reliable than stability polling alone).
+        #
+        # Verified DOM (June 2026): the stop button is a ds-button--circle with
+        # a square SVG icon (not the send arrow). It carries ds-button--primary
+        # while streaming and is removed from the DOM when generation ends.
         "stop_button": [
+            # Structural: circle ds-button that is NOT the send button
+            # (send button gets ds-button--disabled when streaming; stop button does not)
+            ".ds-button--circle.ds-button--primary:not(.ds-button--disabled):has(svg[class*='stop'])",
+            ".ds-button--circle:has(svg[class*='stop'])",
+            # aria / role fallbacks
             'div[role="button"][aria-label*="stop" i]',
+            'button[aria-label*="stop" i]',
             "div.ds-icon-button[aria-label*='stop' i]",
+            # Class-fragment fallback (last resort — broad)
+            'div[class*="stop-btn"]',
+            'div[class*="stopBtn"]',
             'div[class*="stop"]',
         ],
         # "New chat" button in the top-left sidebar. TODO: verify.
