@@ -157,33 +157,30 @@ DEEPSEEK_CONFIG: dict = {
         ],
         # Container holding rendered AI response markdown. DeepSeek uses the
         # ds- product namespace; .ds-markdown is the rendered response body.
+        # CONFIRMED (June 2026): class is 'ds-markdown ds-assistant-message-main-content'
         "response_container": [
+            "div.ds-assistant-message-main-content",
+            "div.ds-markdown.ds-assistant-message-main-content",
             "div.ds-markdown",
+            "div[class*='ds-assistant-message-main-content']",
             "div[class*='ds-markdown']",
-            "div[class*='markdown']",
         ],
         # The latest assistant message specifically (last response bubble).
         #
-        # FIX (Bug #1): Extended with robust structural + role-based fallbacks that
-        # survive DeepSeek React SPA class-name churn. Ordered from most-specific
-        # to most-permissive so the scraper latches onto the tightest match first.
+        # CONFIRMED DOM (June 2026):
+        #   class = 'ds-markdown ds-assistant-message-main-content'
+        #   No data-role attribute on the element itself.
         #
-        # Selector rationale:
-        #   1. div.ds-markdown:last-of-type         — original, most precise
-        #   2. div[class*='ds-markdown']:last-of-type — partial-class variant
-        #   3. [data-role='assistant'] .ds-markdown  — role-attribute anchor (stable if present)
-        #   4. [data-role='assistant']:last-of-type  — role-only, no class dependency
-        #   5. div[class*='markdown']:last-of-type   — broadest class fragment
-        #   6. .dad65929:last-of-type               — confirmed minified wrapper (June 2026)
-        #   7. div[class*='_message']:last-of-type   — generic message bubble fallback
+        # CRITICAL: DeepSeek uses a virtual list (ds-virtual-list) — only
+        # messages visible in the viewport are in the DOM. skip_count based
+        # counting is unreliable. We read the LAST visible element directly.
+        # The selector must NOT use :last-of-type (always count=1 in Playwright).
         "assistant_message": [
-            "div.ds-markdown:last-of-type",
-            "div[class*='ds-markdown']:last-of-type",
-            "[data-role='assistant'] div.ds-markdown",
-            "[data-role='assistant']:last-of-type",
-            "div[class*='markdown']:last-of-type",
-            ".dad65929:last-of-type",
-            "div[class*='_message']:last-of-type",
+            "div.ds-assistant-message-main-content",
+            "div.ds-markdown.ds-assistant-message-main-content",
+            "div[class*='ds-assistant-message-main-content']",
+            "div.ds-markdown",
+            "div[class*='ds-markdown']",
         ],
         # "Typing"/generation in-progress indicator. TODO: verify.
         "loading_indicator": [
@@ -411,8 +408,8 @@ DEEPSEEK_CONFIG: dict = {
         "page_load": 60,
         "response_wait": 300,
         "stability_check": 2.0,      # how long content must be unchanged
-        "stability_polls": 4,        # consecutive stable polls required
-        "poll_interval": 0.8,
+        "stability_polls": 2,        # consecutive stable polls required (was 4 — halved for speed)
+        "poll_interval": 0.5,        # poll every 0.5s (was 0.8s — faster detection)
         "between_actions": 0.4,
     },
 }

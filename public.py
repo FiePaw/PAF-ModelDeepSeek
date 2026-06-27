@@ -409,6 +409,18 @@ class LocalWorker:
     async def _handle_task(self, ws, msg: dict) -> None:
         task_id = msg.get("task_id")
         request = msg.get("request", {})
+        t_received = time.monotonic()
+        prompt_preview = (request.get("prompt") or "")[:60].replace("\n", " ")
+        mode = request.get("mode", "new")
+        session_id = request.get("session_id")
+
+        log.info(
+            "[%s] TASK RECEIVED | mode=%s session=%s prompt=%r",
+            task_id,
+            mode,
+            (session_id or "")[:8] or "-",
+            prompt_preview,
+        )
 
         try:
             # Feature 11: Reject stream: true
@@ -422,19 +434,30 @@ class LocalWorker:
                 return
 
             # Feature 3: Per-session lock (anti-collision for CONTINUE)
-            session_id = request.get("session_id")
-            mode = request.get("mode", "new")
+            t_exec_start = time.monotonic()
             if session_id and mode == "continue":
                 lock = await self._get_session_lock(session_id)
                 async with lock:
+                    t_lock_wait = time.monotonic() - t_exec_start
+                    if t_lock_wait > 0.05:
+                        log.debug(
+                            "[%s] Waited %.2fs for session lock", task_id, t_lock_wait
+                        )
                     result = await self._execute_task(request)
             else:
                 result = await self._execute_task(request)
+
+            t_exec_elapsed = time.monotonic() - t_exec_start
+            t_total_elapsed = time.monotonic() - t_received
 
             # Feature 10: Error forwarding with HTTP status
             if not result.get("ok"):
                 error_msg = result.get("error", "Unknown error")
                 status = self._map_error_to_status(error_msg)
+                log.warning(
+                    "[%s] TASK FAILED | elapsed=%.2fs | error=%s",
+                    task_id, t_total_elapsed, error_msg[:120],
+                )
                 await self._send_error(ws, task_id, error_msg, status=status)
                 return
 
@@ -457,6 +480,18 @@ class LocalWorker:
                     (s.conversation_url or "")[:60], s.turn_count,
                 )
 
+            response_len = len(result.get("text") or "")
+            log.info(
+                "[%s] TASK DONE | total=%.2fs scrape=%.2fs | account=%s mode=%s "
+                "response_chars=%d",
+                task_id,
+                t_total_elapsed,
+                t_exec_elapsed,
+                result.get("account", "-"),
+                mode,
+                response_len,
+            )
+
             await ws.send(
                 json.dumps(
                     {
@@ -468,7 +503,11 @@ class LocalWorker:
                 )
             )
         except Exception as exc:
-            log.error("Task %s failed: %s", task_id, exc, exc_info=True)
+            t_total_elapsed = time.monotonic() - t_received
+            log.error(
+                "[%s] TASK ERROR | elapsed=%.2fs | %s",
+                task_id, t_total_elapsed, exc, exc_info=True,
+            )
             await self._send_error(ws, task_id, str(exc), status=500)
 
     async def _execute_task(self, request: dict) -> dict:
@@ -535,6 +574,7 @@ class LocalWorker:
 
         # Run task through pool
         try:
+            t0 = time.monotonic()
             # Turn 2 path: tool results → scrape_with_tool_result()
             if mode == "continue" and tool_msgs:
                 # The caller sends the next user message (if any) after tool results.
@@ -571,6 +611,11 @@ class LocalWorker:
                     preferred_account=preferred_account,
                     conversation_url=conversation_url,
                 )
+            elapsed = time.monotonic() - t0
+            log.debug(
+                "_execute_task done | ok=%s elapsed=%.2fs mode=%s account=%s",
+                result.get("ok"), elapsed, mode, result.get("account", "-"),
+            )
             return result
         except Exception as exc:
             return {"ok": False, "error": str(exc)}

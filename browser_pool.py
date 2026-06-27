@@ -13,6 +13,7 @@ NEW FEATURES:
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -377,10 +378,19 @@ class BrowserPool:
         scrape() is called. scrape() → _count_response_elements() therefore
         sees the fully hydrated DOM, and the skip_count baseline is correct.
         """
+        t_acquire_start = time.monotonic()
         slot = await self._acquire_with_account(
             timeout=acquire_timeout, preferred_account=preferred_account
         )
+        t_acquire_elapsed = time.monotonic() - t_acquire_start
+        log.debug(
+            "run_task: slot %d acquired in %.2fs (account=%s mode=%s)",
+            slot.index, t_acquire_elapsed, slot.account, mode,
+        )
+
         try:
+            t_scrape_start = time.monotonic()
+
             # CONTINUE navigation ----------------------------------------
             if conversation_url and slot.scraper and slot.scraper.page:
                 current_url = slot.scraper.page.url or ""
@@ -423,9 +433,24 @@ class BrowserPool:
             result = await slot.scraper.scrape(
                 prompt, mode=mode, attachments=attachments, **send_kwargs
             )
+            t_scrape_elapsed = time.monotonic() - t_scrape_start
+            t_total_elapsed = time.monotonic() - t_acquire_start
+
             # Attach the current page URL so public.py can persist it in the session.
             if result.get("ok") and slot.scraper and slot.scraper.page:
                 result.setdefault("conversation_url", slot.scraper.page.url)
+
+            log.info(
+                "run_task done | slot=%d account=%s mode=%s ok=%s | "
+                "acquire=%.2fs scrape=%.2fs total=%.2fs",
+                slot.index,
+                slot.account,
+                mode,
+                result.get("ok"),
+                t_acquire_elapsed,
+                t_scrape_elapsed,
+                t_total_elapsed,
+            )
             return result
         except Exception as exc:
             log.error("run_task failed on slot %d: %s", slot.index, exc, exc_info=True)
@@ -458,10 +483,19 @@ class BrowserPool:
         _wait_for_spa_ready() so _count_response_elements() inside
         scrape_with_tool_result() sees the correct baseline element count.
         """
+        t_acquire_start = time.monotonic()
         slot = await self._acquire_with_account(
             timeout=acquire_timeout, preferred_account=preferred_account
         )
+        t_acquire_elapsed = time.monotonic() - t_acquire_start
+        log.debug(
+            "run_task_with_tool_result: slot %d acquired in %.2fs (account=%s)",
+            slot.index, t_acquire_elapsed, slot.account,
+        )
+
         try:
+            t_scrape_start = time.monotonic()
+
             if conversation_url and slot.scraper and slot.scraper.page:
                 current_url = slot.scraper.page.url or ""
                 already_there = (
@@ -494,8 +528,23 @@ class BrowserPool:
                 tool_messages=tool_messages,
                 next_user_msg=next_user_msg,
             )
+
+            t_scrape_elapsed = time.monotonic() - t_scrape_start
+            t_total_elapsed = time.monotonic() - t_acquire_start
+
             if result.get("ok") and slot.scraper and slot.scraper.page:
                 result.setdefault("conversation_url", slot.scraper.page.url)
+
+            log.info(
+                "run_task_with_tool_result done | slot=%d account=%s ok=%s | "
+                "acquire=%.2fs scrape=%.2fs total=%.2fs",
+                slot.index,
+                slot.account,
+                result.get("ok"),
+                t_acquire_elapsed,
+                t_scrape_elapsed,
+                t_total_elapsed,
+            )
             return result
         except Exception as exc:
             log.error(

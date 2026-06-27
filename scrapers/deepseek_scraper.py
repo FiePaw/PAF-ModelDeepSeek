@@ -720,6 +720,7 @@ class DeepSeekScraper(BaseAIChatScraper):
                 await self.launch_browser(self.account)
 
             initial_response_count = await self._count_response_elements()
+            await self._snapshot_baseline_text()
             await self.send_prompt(wrapped_prompt, mode="continue")
 
             from config import DEEPSEEK_CONFIG as _DS_CFG
