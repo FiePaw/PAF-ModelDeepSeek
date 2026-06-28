@@ -555,8 +555,15 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
             choice["message"]["tool_calls"] = tool_calls
 
         # Feature 11: x_meta block with extended metadata
+        # BUG FIX #3: Include the actual mode used by the worker so the
+        # client can verify whether mode="continue" was honoured or fell
+        # back to "new". Also surface mode_fallback (bool) when the
+        # worker had to fall back because the session was missing/expired.
+        actual_mode = result.get("mode", mode)
         x_meta = {
             "session_id": session_id,
+            "mode": actual_mode,
+            "mode_fallback": result.get("mode_fallback", False),
             "account": result.get("account"),
             "conversation_url": result.get("conversation_url"),
             "model_tab": model_tab,

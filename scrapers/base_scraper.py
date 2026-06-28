@@ -591,17 +591,28 @@ class BaseAIChatScraper(ABC):
                         raise RuntimeError("Login failed and no account to rotate")
                 _t_auth = time.monotonic()
 
-                # Snapshot response count BEFORE sending the prompt.
-                # In CONTINUE mode the page already has N old responses;
-                # wait_for_response uses this baseline to skip them and only
-                # read the NEW response once it appears.
-                initial_response_count = await self._count_response_elements()
-                log.debug(
-                    "Response baseline before send: %d element(s) on page",
-                    initial_response_count,
-                )
-
-                await self.send_prompt(prompt, mode=mode, **merged_kwargs)
+                # Send the prompt first (which navigates for NEW mode).
+                # For NEW mode, send_prompt -> _ensure_page_ready -> _goto_new_chat()
+                # navigates to a fresh page BEFORE we can snapshot the baseline.
+                # Snapshotting BEFORE send_prompt would read the OLD page's response
+                # count (e.g. 3 from a previous CONTINUE session), causing
+                # wait_for_response to wait for count > 3 on a fresh page that
+                # only ever has 1 response -> 300s timeout.
+                # Fix: for NEW mode, baseline is always 0 (fresh page has no
+                # prior responses). For CONTINUE mode, snapshot AFTER we know
+                # the page is stable (send_prompt does not navigate in CONTINUE).
+                if mode == "new":
+                    initial_response_count = 0
+                    log.debug("NEW mode: response baseline forced to 0 (fresh page)")
+                    await self.send_prompt(prompt, mode=mode, **merged_kwargs)
+                else:
+                    # CONTINUE: snapshot before send (page is not navigated).
+                    initial_response_count = await self._count_response_elements()
+                    log.debug(
+                        "CONTINUE mode: response baseline before send: %d element(s)",
+                        initial_response_count,
+                    )
+                    await self.send_prompt(prompt, mode=mode, **merged_kwargs)
                 _t_send = time.monotonic()
 
                 t = DEEPSEEK_CONFIG["timeouts"]

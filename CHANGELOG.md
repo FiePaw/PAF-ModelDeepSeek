@@ -5,6 +5,117 @@ Format: `[version] YYYY-MM-DD — summary`
 
 ---
 
+## [2.2.1] 2026-06-28 — Critical bug fixes: mode=new response timeout + CONTINUE mode reliability
+
+Rilis ini memperbaiki **5 bug** yang ditemukan setelah optimasi v2.2.0: satu bug
+kritis pada scraper (mode=new timeout 300s karena response baseline salah) dan
+empat bug pada pipeline session CONTINUE (mode tidak pernah benar-benar aktif
+di sisi client, server fallback tanpa notifikasi, dan metadata response tidak
+lengkap). Ditambahkan juga `chatCLI.py` — interactive CLI untuk testing API.
+
+### Bug Fixes
+
+#### `scrapers/base_scraper.py` — Response baseline ordering fix (CRITICAL)
+- **Root cause:** `scrape()` mengambil snapshot `initial_response_count` dari
+  halaman **sebelum** `send_prompt()` dipanggil. Pada mode `new`,
+  `send_prompt()` → `_ensure_page_ready("new")` → `_goto_new_chat()` navigasi
+  ke halaman kosong. Namun snapshot sudah terlanjur diambil dari halaman lama
+  (yang mungkin punya N response dari sesi sebelumnya).
+- **Dampak:** `wait_for_response()` menunggu `count > N` pada halaman baru
+  yang hanya punya 1 response → tidak pernah terpenuhi → **timeout 300s**.
+- **Fix:** Untuk mode `new`, baseline di-hardcode ke `0` (halaman baru selalu
+  kosong). Untuk mode `continue`, snapshot diambil sebelum `send_prompt()`
+  (tidak ada navigasi pada continue).
+- **Kenapa baru muncul:** Optimasi v2.2.0 menghilangkan banyak sleep/delay
+  yang sebelumnya secara tidak sengaja menutupi race condition ini.
+
+#### `chatCLI.py` — Auto-capture server-generated session_id (Bug #1)
+- **Root cause:** Saat user mengirim pesan tanpa explicit `session_id`, VPS
+  auto-generate `sess-xxxx` dan simpannya di worker. Namun chatCLI tidak
+  membaca balik `session_id` dari `x_meta` response.
+- **Dampak:** Setiap pesan menggunakan `session_id=None` → VPS selalu generate
+  session baru → selalu `mode=new`, CONTINUE tidak pernah aktif.
+- **Fix:** Setelah response sukses, chatCLI membaca `x_meta.session_id` dan
+  menyimpannya di `state.session_id` untuk pesan berikutnya. Ditampilkan info
+  `"Auto-captured session: sess-xxxx"`.
+
+#### `chatCLI.py` — first_message_sent set before request (Bug #2)
+- **Root cause:** `first_message_sent = True` di-set **sebelum** `client.chat()`
+  dipanggil. Jika request pertama gagal (error/timeout), CLI mengira session
+  sudah terkirim, padahal server belum menyimpan session.
+- **Dampak:** Pesan kedua dikirim dengan `mode=continue` → server tidak punya
+  session → silent fallback ke `mode=new`.
+- **Fix:** `first_message_sent` hanya di-set **setelah** response sukses.
+  Jika request pertama gagal, pesan berikutnya tetap `mode=new`.
+
+#### `PublicForward/ForVPS/vps_server.py` — x_meta missing mode field (Bug #3)
+- **Root cause:** `x_meta` dalam response tidak menyertakan field `mode`.
+- **Dampak:** Client tidak bisa memverifikasi apakah server menghormati
+  `mode=continue` atau diam-diam fallback ke `mode=new`.
+- **Fix:** Ditambahkan `"mode"` (mode aktual yang dipakai worker) dan
+  `"mode_fallback"` (boolean, `true` jika continue di-downgrade ke new)
+  ke `x_meta`.
+
+#### `public.py` — Silent fallback to NEW without notification (Bug #4)
+- **Root cause:** Saat `session_store.get(session_id)` mengembalikan `None`
+  (session expired, worker restart, atau worker berbeda), mode diam-diam
+  diubah ke `"new"` tanpa indikasi dalam response.
+- **Dampak:** Client tidak tahu bahwa context percakapan hilang dan dimulai
+  dari awal.
+- **Fix:** Ditambahkan flag `mode_fallback = True` dalam result ketika
+  fallback terjadi. Flag ini di-propagate melalui result → VPS x_meta →
+  client, sehingga client bisa reset state session dan re-create session.
+
+### New Features
+
+#### `chatCLI.py` — Interactive CLI test tool (NEW FILE)
+- CLI interaktif untuk testing API endpoint `POST /v1/chat/completions`.
+- Mendukung session management (`/new`, `/continue`, `/session`), mode
+  selection (`/think`), account routing (`/account`), server health check
+  (`/health`), dan conversation history (`/history`).
+- **Auto mode transition:** Pesan pertama dalam session otomatis `mode=new`,
+  pesan berikutnya otomatis `mode=continue`.
+- **Auto session capture:** Jika user mengirim pesan tanpa session, CLI
+  otomatis membaca `session_id` dari server response.
+- **Mode fallback detection:** Mendeteksi dan menampilkan warning jika
+  server men-downgrade `continue` ke `new`.
+- Colored output dengan ANSI codes, `x_meta` display (toggle dengan
+  `/meta`), dan `--base-url` / `--session` / `--think` CLI flags.
+- Usage: `python chatCLI.py [--base-url URL] [--session ID] [--think MODE]`
+
+### Documentation
+
+#### `API_USAGE.md` — Updated response metadata documentation
+- Documented `mode` dan `mode_fallback` fields baru di `x_meta`.
+- Field name dikoreksi: `account_name` → `account`, `search` → `web_search`.
+- Ditambahkan `response_time` (float, seconds) dan `timestamp` (unix).
+- Ditambahkan section "Handling `mode_fallback`" dengan contoh response
+  dan client action.
+- Python client example di-update untuk handle `mode_fallback`.
+- Version bump ke 2.2.1.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `scrapers/base_scraper.py` | Fix response baseline ordering for mode=new |
+| `chatCLI.py` | New file — interactive CLI test tool |
+| `public.py` | Add `mode_fallback` flag on session fallback |
+| `PublicForward/ForVPS/vps_server.py` | Add `mode` and `mode_fallback` to x_meta |
+| `API_USAGE.md` | Updated response metadata docs |
+
+### Impact
+- **mode=new timeout bug dieliminasi** — scraper sekarang selalu menggunakan
+  baseline 0 untuk mode new, memastikan `wait_for_response()` langsung
+  menangkap response baru.
+- **Session CONTINUE sekarang reliable** — auto-capture session_id,
+  `first_message_sent` hanya di-set setelah sukses, dan mode fallback
+  ter-notifikasi ke client.
+- Tidak ada breaking change pada API contract — field baru `mode` dan
+  `mode_fallback` di `x_meta` bersifat additive (client lama mengabaikannya).
+
+---
+
 ## [2.2.0] 2026-06-27 — Performance optimisation + per-stage timing instrumentation
 
 Rilis ini fokus pada **kecepatan per-proses**. Sebelumnya satu proses bisa

@@ -542,6 +542,7 @@ class LocalWorker:
         # conversation_url AND the pinned account so we land on the
         # same browser slot that handled Turn 1.
         conversation_url: Optional[str] = None
+        _mode_fallback = False
         if mode == "continue" and session_id:
             existing = self.session_store.get(session_id)
             if existing:
@@ -561,6 +562,12 @@ class LocalWorker:
                     session_id[:8],
                 )
                 mode = "new"
+                # BUG FIX #4: Flag the fallback so the client knows the
+                # requested mode was not honoured. This flag propagates
+                # through the result → VPS x_meta → chatCLI, allowing the
+                # client to reset its session state and re-create the
+                # session on the next message.
+                _mode_fallback = True
 
         # Feature 4: preferred_account routing with fallback
         if preferred_account:
@@ -612,9 +619,17 @@ class LocalWorker:
                     conversation_url=conversation_url,
                 )
             elapsed = time.monotonic() - t0
+
+            # BUG FIX #4: Inject mode_fallback flag into the result so
+            # the VPS can surface it in x_meta and the client knows when
+            # mode="continue" was silently downgraded to "new".
+            if _mode_fallback:
+                result["mode_fallback"] = True
+
             log.debug(
-                "_execute_task done | ok=%s elapsed=%.2fs mode=%s account=%s",
+                "_execute_task done | ok=%s elapsed=%.2fs mode=%s account=%s fallback=%s",
                 result.get("ok"), elapsed, mode, result.get("account", "-"),
+                _mode_fallback,
             )
             return result
         except Exception as exc:
