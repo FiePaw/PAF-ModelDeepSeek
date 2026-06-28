@@ -1,407 +1,77 @@
-# Changelog — PAF-ModelDeepSeek
+# 📡 PAF-ModelDeepSeek API Usage Guide
 
-All notable changes to this project are documented here.
-Format: `[version] YYYY-MM-DD — summary`
+## 🌐 Base URL
 
----
-
-## [2.2.1] 2026-06-28 — Critical bug fixes: mode=new response timeout + CONTINUE mode reliability
-
-Rilis ini memperbaiki **5 bug** yang ditemukan setelah optimasi v2.2.0: satu bug
-kritis pada scraper (mode=new timeout 300s karena response baseline salah) dan
-empat bug pada pipeline session CONTINUE (mode tidak pernah benar-benar aktif
-di sisi client, server fallback tanpa notifikasi, dan metadata response tidak
-lengkap). Ditambahkan juga `chatCLI.py` — interactive CLI untuk testing API.
-
-### Bug Fixes
-
-#### `scrapers/base_scraper.py` — Response baseline ordering fix (CRITICAL)
-- **Root cause:** `scrape()` mengambil snapshot `initial_response_count` dari
-  halaman **sebelum** `send_prompt()` dipanggil. Pada mode `new`,
-  `send_prompt()` → `_ensure_page_ready("new")` → `_goto_new_chat()` navigasi
-  ke halaman kosong. Namun snapshot sudah terlanjur diambil dari halaman lama
-  (yang mungkin punya N response dari sesi sebelumnya).
-- **Dampak:** `wait_for_response()` menunggu `count > N` pada halaman baru
-  yang hanya punya 1 response → tidak pernah terpenuhi → **timeout 300s**.
-- **Fix:** Untuk mode `new`, baseline di-hardcode ke `0` (halaman baru selalu
-  kosong). Untuk mode `continue`, snapshot diambil sebelum `send_prompt()`
-  (tidak ada navigasi pada continue).
-- **Kenapa baru muncul:** Optimasi v2.2.0 menghilangkan banyak sleep/delay
-  yang sebelumnya secara tidak sengaja menutupi race condition ini.
-
-#### `chatCLI.py` — Auto-capture server-generated session_id (Bug #1)
-- **Root cause:** Saat user mengirim pesan tanpa explicit `session_id`, VPS
-  auto-generate `sess-xxxx` dan simpannya di worker. Namun chatCLI tidak
-  membaca balik `session_id` dari `x_meta` response.
-- **Dampak:** Setiap pesan menggunakan `session_id=None` → VPS selalu generate
-  session baru → selalu `mode=new`, CONTINUE tidak pernah aktif.
-- **Fix:** Setelah response sukses, chatCLI membaca `x_meta.session_id` dan
-  menyimpannya di `state.session_id` untuk pesan berikutnya. Ditampilkan info
-  `"Auto-captured session: sess-xxxx"`.
-
-#### `chatCLI.py` — first_message_sent set before request (Bug #2)
-- **Root cause:** `first_message_sent = True` di-set **sebelum** `client.chat()`
-  dipanggil. Jika request pertama gagal (error/timeout), CLI mengira session
-  sudah terkirim, padahal server belum menyimpan session.
-- **Dampak:** Pesan kedua dikirim dengan `mode=continue` → server tidak punya
-  session → silent fallback ke `mode=new`.
-- **Fix:** `first_message_sent` hanya di-set **setelah** response sukses.
-  Jika request pertama gagal, pesan berikutnya tetap `mode=new`.
-
-#### `PublicForward/ForVPS/vps_server.py` — x_meta missing mode field (Bug #3)
-- **Root cause:** `x_meta` dalam response tidak menyertakan field `mode`.
-- **Dampak:** Client tidak bisa memverifikasi apakah server menghormati
-  `mode=continue` atau diam-diam fallback ke `mode=new`.
-- **Fix:** Ditambahkan `"mode"` (mode aktual yang dipakai worker) dan
-  `"mode_fallback"` (boolean, `true` jika continue di-downgrade ke new)
-  ke `x_meta`.
-
-#### `public.py` — Silent fallback to NEW without notification (Bug #4)
-- **Root cause:** Saat `session_store.get(session_id)` mengembalikan `None`
-  (session expired, worker restart, atau worker berbeda), mode diam-diam
-  diubah ke `"new"` tanpa indikasi dalam response.
-- **Dampak:** Client tidak tahu bahwa context percakapan hilang dan dimulai
-  dari awal.
-- **Fix:** Ditambahkan flag `mode_fallback = True` dalam result ketika
-  fallback terjadi. Flag ini di-propagate melalui result → VPS x_meta →
-  client, sehingga client bisa reset state session dan re-create session.
-
-### New Features
-
-#### `chatCLI.py` — Interactive CLI test tool (NEW FILE)
-- CLI interaktif untuk testing API endpoint `POST /v1/chat/completions`.
-- Mendukung session management (`/new`, `/continue`, `/session`), mode
-  selection (`/think`), account routing (`/account`), server health check
-  (`/health`), dan conversation history (`/history`).
-- **Auto mode transition:** Pesan pertama dalam session otomatis `mode=new`,
-  pesan berikutnya otomatis `mode=continue`.
-- **Auto session capture:** Jika user mengirim pesan tanpa session, CLI
-  otomatis membaca `session_id` dari server response.
-- **Mode fallback detection:** Mendeteksi dan menampilkan warning jika
-  server men-downgrade `continue` ke `new`.
-- Colored output dengan ANSI codes, `x_meta` display (toggle dengan
-  `/meta`), dan `--base-url` / `--session` / `--think` CLI flags.
-- Usage: `python chatCLI.py [--base-url URL] [--session ID] [--think MODE]`
-
-### Documentation
-
-#### `API_USAGE.md` — Updated response metadata documentation
-- Documented `mode` dan `mode_fallback` fields baru di `x_meta`.
-- Field name dikoreksi: `account_name` → `account`, `search` → `web_search`.
-- Ditambahkan `response_time` (float, seconds) dan `timestamp` (unix).
-- Ditambahkan section "Handling `mode_fallback`" dengan contoh response
-  dan client action.
-- Python client example di-update untuk handle `mode_fallback`.
-- Version bump ke 2.2.1.
-
-### Files Changed
-
-| File | Change |
-|------|--------|
-| `scrapers/base_scraper.py` | Fix response baseline ordering for mode=new |
-| `chatCLI.py` | New file — interactive CLI test tool |
-| `public.py` | Add `mode_fallback` flag on session fallback |
-| `PublicForward/ForVPS/vps_server.py` | Add `mode` and `mode_fallback` to x_meta |
-| `API_USAGE.md` | Updated response metadata docs |
-
-### Impact
-- **mode=new timeout bug dieliminasi** — scraper sekarang selalu menggunakan
-  baseline 0 untuk mode new, memastikan `wait_for_response()` langsung
-  menangkap response baru.
-- **Session CONTINUE sekarang reliable** — auto-capture session_id,
-  `first_message_sent` hanya di-set setelah sukses, dan mode fallback
-  ter-notifikasi ke client.
-- Tidak ada breaking change pada API contract — field baru `mode` dan
-  `mode_fallback` di `x_meta` bersifat additive (client lama mengabaikannya).
-
----
-
-## [2.2.0] 2026-06-27 — Performance optimisation + per-stage timing instrumentation
-
-Rilis ini fokus pada **kecepatan per-proses**. Sebelumnya satu proses bisa
-memakan >30 detik dengan banyak waktu mati (dead time) yang tidak berasal dari
-kecepatan model itu sendiri, melainkan dari timeout berlebih, jeda UI, dan
-ekor stabilitas yang panjang. Selain optimasi, ditambahkan instrumentasi
-timing sehingga bagian yang lambat bisa **diukur**, bukan ditebak.
-
-Tidak ada perubahan perilaku fungsional (mode, tools, session, CONTINUE tetap
-sama) — hanya penghematan latensi dan logging baru.
-
-### Performance Optimisations
-
-#### `scrapers/deepseek_scraper.py` — `_find_first()` two-phase lookup
-- **Bug latensi tersembunyi diperbaiki.** Sebelumnya `_find_first` menunggu
-  timeout PENUH untuk SETIAP selector dalam daftar. Daftar berisi N selector
-  yang tidak ada di DOM = `timeout × N` (mis. 3 selector × 2500ms = **7.5s
-  terbuang**).
-- Sekarang dua fase: **(1)** cek keberadaan instan tanpa menunggu (kasus umum
-  langsung kembali tanpa biaya timeout), **(2)** jika tidak ketemu, budget
-  timeout **dibagi rata** lintas selector sehingga total tunggu tidak pernah
-  melebihi `timeout_ms`.
-
-#### `scrapers/deepseek_scraper.py` — `_select_model_tab()`
-- Lewati seluruh pencarian + klik tab bila mode yang diminta == mode default.
-  Chat baru selalu terbuka pada mode default, jadi tidak ada yang perlu diubah
-  pada jalur "instant" yang paling umum. Timeout pencarian tab diturunkan ke
-  `timeouts.element_find`.
-
-#### `scrapers/deepseek_scraper.py` — `_set_toggle()`
-- Timeout pencarian toggle DeepThink/Search diturunkan dari 2500ms ke
-  `timeouts.element_find` (1500ms), memanfaatkan fast-path `_find_first`.
-
-#### `scrapers/deepseek_scraper.py` — `_goto_new_chat()`
-- Reset `_active_model_tab = None` saat membuka chat baru (chat baru me-reset
-  mode pills ke default) agar keputusan `_select_model_tab()` tetap benar.
-
-#### `config.py` — timeouts & typing
-- `stability_polls`: 4 → **2** dan `poll_interval`: 0.8 → **0.5** → ekor
-  stabilitas turun dari **3.2s → 1.0s** (~2.2s hemat per proses).
-- `between_actions`: 0.4 → **0.2** (~1s hemat akumulatif per proses).
-- `type_delay_ms`: 15 → **0** — key event tetap dikirim per karakter, tetapi
-  tanpa delay buatan (prompt 200 karakter ≈ 3s hemat).
-- Tambah kunci baru `timeouts.element_find` (1500ms) sebagai budget bersama
-  pencarian elemen UI.
-
-### New — Timing Instrumentation (INFO log)
-- `scrapers/base_scraper.py` `scrape()` kini mencetak ringkasan per tahap:
-  `[TIMING] auth=… send=… wait=… total=… (mode=…)`.
-- `scrapers/deepseek_scraper.py` `send_prompt()` mencetak rincian sub-tahap:
-  `[TIMING] send_prompt: nav=… controls=… type=… send=… (mode=…)`.
-- Memudahkan menemukan bottleneck nyata tanpa menambah dependensi.
-
-### Impact
-- Estimasi penghematan overhead non-model: **~6–13 detik per proses** pada
-  kasus umum (terutama dari perbaikan `_find_first`, skip tab default, ekor
-  stabilitas, dan typing delay). Waktu generasi model tetap apa adanya.
-
----
-
-## [2.1.0] 2026-06-27 — Session persistence overhaul, Turn 2 tool-result, CONTINUE mode bug fixes
-
-Rilis ini membawa arsitektur session baru yang sepenuhnya mengadopsi pola
-PAF-ModelQwen, memperbaiki bug sistematis pada CONTINUE mode, dan menambahkan
-Turn 2 (tool-result injection). File `newpublic_BETA.py` dihapus — semua
-fiturnya sudah dilebur ke `public.py` dan `browser_pool.py`.
-
----
-
-### New Features
-
-#### Session Persistence — `Session` dataclass + `SessionStore` yang di-upgrade (`public.py`)
-
-Sebelumnya `SessionStore` hanya menyimpan JSON mentah tanpa TTL, tanpa restore
-saat startup, dan tanpa account pinning. Kini diganti penuh dengan:
-
-- **`Session` dataclass** — fields: `session_id`, `account`, `conversation_url`,
-  `created_at`, `last_used`, `turn_count`
-- **TTL-aware `get()`** — auto-hapus session expired dari memory + disk
-- **`load_from_disk()`** — restore semua session non-expired saat startup
-  (conversation bisa dilanjutkan setelah worker restart)
-- **`cleanup_expired()`** — background pruning memory + disk
-- **`bump_turn()`** — increment `turn_count` setiap turn berhasil
-- **`get_or_create()`** dan **`update()`** — upsert atomic dengan persist ke disk
-- **Account pinning** — `Session.account` disimpan → CONTINUE selalu diarahkan
-  ke account yang sama dengan Turn 1
-
-#### Background cleanup loop (`public.py`)
-
-- `LocalWorker._cleanup_loop()` — asyncio task berjalan setiap 60 detik,
-  memanggil `SessionStore.cleanup_expired()` dan `_cleanup_session_locks()`
-- `_session_locks_meta` — timestamp per-lock; lock idle >1 jam di-GC otomatis
-- `--session-ttl` CLI flag — konfigurasi TTL session (default: 3600 detik)
-
-#### Turn 2 — Tool-result injection
-
-CONTINUE mode kini mendukung multi-turn dengan tool calls:
-
-**`scrapers/deepseek_scraper.py` — `scrape_with_tool_result()`**
-
-Membangun prompt terstruktur dan mengirimnya ke thread yang sedang berjalan:
 ```
-[TOOL RESULT]
-{"tool_call_id": "c1", "name": "write_file", "result": "done"}
-
-[USER REQUEST]        ← opsional (next_user_msg)
-{"prompt": "sekarang jalankan"}
+http://16.79.2.204:9000
 ```
 
-**`browser_pool.py` — `run_task_with_tool_result()`**
+All endpoints are accessible via this base URL. For production, use HTTPS with a reverse proxy.
 
-Mengambil slot dengan account yang sama (pinned), re-navigasi ke conversation
-URL jika perlu, lalu memanggil `scrape_with_tool_result()`. Selalu release
-dengan `reset=False` untuk menjaga page tetap hidup.
+---
 
-**`public.py` — `_execute_task()`**
+## 🔑 Authentication
 
-Mendeteksi `tool_messages` dalam payload → routing ke
-`pool.run_task_with_tool_result()` instead of `pool.run_task()`.
+Currently, the API does not require authentication tokens in requests. Authentication is handled at the VPS level via the worker connection token.
 
-#### `BrowserPool` — skip-goto optimisation + `release(reset=)` (`browser_pool.py`)
+---
 
-- **`acquire_pinned(slot_index)`** — ambil slot spesifik berdasarkan index
-  (untuk CONTINUE pinning); fallback ke idle slot jika tidak tersedia
-- **`release(slot, reset=True)`** — `reset=False` pada CONTINUE: page tetap
-  hidup di URL conversation, siap untuk turn berikutnya tanpa reload
-- **Skip-goto optimisation** di `run_task()`: bandingkan `page.url` dengan
-  `conversation_url`; jika sudah sama, set `_conversation_started=True` dan
-  skip `page.goto()` (hemat 2–6 detik)
-- Navigation diganti dari `networkidle` ke `domcontentloaded + asyncio.sleep(2)`
-  — lebih reliable untuk SPA DeepSeek yang tidak pernah benar-benar mencapai
-  `networkidle`
-- `conversation_url` di-attach otomatis ke result dict setelah setiap turn
+## 📋 Available Endpoints
 
-#### `_ensure_page_ready()` — single navigation gate (`scrapers/deepseek_scraper.py`)
+### 1. Health Check
+**GET** `/health`
 
-Mengadopsi pola PAF-ModelQwen secara penuh:
+Check VPS server health and worker status.
 
-```python
-async def _ensure_page_ready(self, mode: str) -> None:
-    if mode == "new" or not self._conversation_started:
-        await self._goto_new_chat()   # NEW → fresh thread
-    else:
-        # CONTINUE → URL sanity check (lihat Bug Fixes)
-        if base_url not in page.url:
-            await self._goto_new_chat()  # fallback jika page drift
-```
-
-- `_conversation_started: bool` — flag instance baru di `__init__`
-- `_goto_new_chat()` selalu reset `_conversation_started = False`
-- `send_prompt()` menjadikan `_ensure_page_ready()` sebagai **satu-satunya**
-  navigation entry point
-
-#### `scrape_with_tool_result()` — Turn 2 pada standalone scraper (`scrapers/deepseek_scraper.py`)
-
-Dapat dipakai langsung dari `main.py` atau `chat.py` tanpa melalui pool/worker.
-
-#### CLI session persistence (`main.py`)
-
-`--mode continue` sebelumnya tidak menyimpan atau memuat conversation URL —
-setiap run selalu membuka chat baru meskipun mode "continue".
-
-- **`_save_cli_session(session_id, url, account)`** — simpan ke
-  `dataSession/cli_<id>.json` setelah setiap run berhasil
-- **`_load_cli_session(session_id)`** — muat URL + account sebelum scraping
-- **`--session-id`** — nama sesi CLI (default: `"cli"`)
-- Account pinning: CONTINUE menggunakan account yang sama dengan turn pertama
-- Skip-goto optimisation: jika browser sudah di conversation URL, skip `goto()`
-
-#### `examples/chat.py` — Interactive chat client via HTTP API (file baru)
-
-Client interaktif multi-turn yang memanggil `/v1/chat/completions` langsung.
-Tidak ada dependency ke modul internal — hanya butuh `requests`.
-
+**Request:**
 ```bash
-python examples/chat.py
-python examples/chat.py --session-id riset-1
-python examples/chat.py --think-mode thinking
-python examples/chat.py --base-url http://192.168.1.10:9000
+curl http://16.79.2.204:9000/health
 ```
 
-Fitur:
-- Auto-manage `mode`: turn 1 → `"new"`, turn 2+ → `"continue"`
-- Health check saat startup
-- Commands: `/new [id]`, `/status`, `/think <mode>`, `/help`, `/quit`
-- Prompt indicator: `●` = sedang dalam thread, `○` = belum mulai
+**Response:**
+```json
+{
+  "status": "healthy",
+  "workers": {
+    "total_workers": 2,
+    "workers": [
+      {
+        "worker_id": "worker-DESKTOP-ABC123-001",
+        "hostname": "DESKTOP-ABC123",
+        "accounts": ["account1", "account2"],
+        "total_slots": 2,
+        "busy_slots": 0,
+        "connected_at": "2026-06-26T11:45:32Z"
+      },
+      {
+        "worker_id": "worker-SERVER-XYZ789-001",
+        "hostname": "SERVER-XYZ789",
+        "accounts": ["account3", "account4", "account5"],
+        "total_slots": 3,
+        "busy_slots": 1,
+        "connected_at": "2026-06-26T11:47:15Z"
+      }
+    ],
+    "total_accounts": 7,
+    "busy_slots": 1
+  },
+  "timestamp": "2026-06-26T12:30:45Z"
+}
+```
 
 ---
 
-### Bug Fixes
+### 2. List Models (Available Accounts)
+**GET** `/v1/models`
 
-#### CONTINUE mode: prompt dikirim ke halaman baru alih-alih melanjutkan thread
+List all available DeepSeek accounts registered across all workers.
 
-**Root cause (5 lapisan — ditemukan dari analisis mendalam PAF-ModelQwen):**
+**Request:**
+```bash
+curl http://16.79.2.204:9000/v1/models
+```
 
-| # | Lokasi | Masalah |
-|---|--------|---------|
-| 1 | `send_prompt()` | `_ensure_loaded()` dipanggil → `ensure_authenticated()` → `login()` → `page.goto(login_url)` — page pindah dari conversation URL sebelum `_ensure_page_ready()` sempat menjaga |
-| 2 | `is_session_expired()` | Selector `div:has-text("Log in")` mencocokkan **semua** elemen yang mengandung teks "Log in" di subtree-nya — termasuk tombol sidebar, referral banner, dsb. di conversation page → false positive sistematis |
-| 3 | `_ensure_page_ready()` | Tidak ada URL sanity check: jika `_conversation_started=True` tapi page sudah drift ke URL lain, navigation dilewati dan prompt dikirim ke halaman yang salah |
-| 4 | `_rotate_account()` | Tidak mereset `_conversation_started` → setelah rotasi, browser di home page akun baru tapi flag masih `True` → `_ensure_page_ready("continue")` skip goto → prompt ke home page |
-| 5 | `restart_browser()` | Sama dengan #4: `_conversation_started` tidak direset setelah restart |
-
-**Fixes (`scrapers/deepseek_scraper.py`):**
-
-- **Fix 1** — Hapus `_ensure_loaded()` dari `send_prompt()`. Sesuai arsitektur
-  Qwen: `send_prompt()` tidak pernah melakukan auth check. Auth sudah ditangani
-  oleh `base_scraper.scrape()` dan `ChatClient.launch()`.
-
-- **Fix 2** — `is_session_expired()` diperketat:
-
-  ```python
-  # SEBELUM (false positive):
-  for sel in _SEL["login_form"]:   # termasuk 'div:has-text("Log in")'
-      if await page.query_selector(sel): return True
-
-  # SESUDAH (spesifik):
-  pwd = await page.query_selector('input[type="password"]')
-  if pwd and await pwd.is_visible(): return True   # hanya login form nyata
-  ```
-
-- **Fix 3** — `_ensure_page_ready()` CONTINUE path kini memverifikasi URL:
-  jika `base_url` tidak ada di `page.url` → fallback ke `_goto_new_chat()`
-
-- **Fix 4 & 5** — Override `_rotate_account()` dan `restart_browser()` di
-  `DeepSeekScraper` untuk reset `_conversation_started = False`:
-
-  ```python
-  async def _rotate_account(self, restart_first=True) -> bool:
-      result = await super()._rotate_account(restart_first)
-      if result:
-          self._conversation_started = False   # ← baru
-      return result
-  ```
-
-**Fix tambahan (`chat.py`):**
-
-- `ChatClient.send()` kini memverifikasi URL sebelum setiap CONTINUE turn —
-  mirror dari skip-goto optimisation Qwen di `public.py`:
-
-  ```python
-  if _conversation_started and session.conversation_url:
-      already_there = conv_url in page.url or page.url in conv_url
-      if not already_there:
-          await page.goto(conv_url)   # re-navigate jika drift
-          _conversation_started = True
-  ```
-
----
-
-### Removed
-
-- **`newpublic_BETA.py`** — Dihapus. Semua fiturnya (`auto_continue`,
-  slot pinning, `bump_turn`, `load_from_disk`) sudah dilebur ke `public.py`
-  dan `browser_pool.py`.
-
----
-
-### Files Changed
-
-| File | Perubahan |
-|------|-----------|
-| `config.py` | Tambah `session_ttl: 3600` ke `ROTATION_CONFIG` |
-| `public.py` | `Session` dataclass; `SessionStore` TTL/disk/bump_turn/account-pin; `LocalWorker` cleanup loop, lock GC, `--session-ttl`, Turn 2 dispatch |
-| `browser_pool.py` | `acquire_pinned()`, `release(reset=)`, `run_task_with_tool_result()`, skip-goto, domcontentloaded nav, auto-attach `conversation_url` |
-| `scrapers/deepseek_scraper.py` | `_conversation_started` flag; `_ensure_page_ready()`; `_goto_new_chat()` reset; `send_prompt()` tanpa `_ensure_loaded()`; `scrape_with_tool_result()`; fix `is_session_expired()`; override `_rotate_account()` + `restart_browser()` |
-| `main.py` | `_save_cli_session()`, `_load_cli_session()`, `--session-id`, account pinning, skip-goto untuk `--mode continue` |
-| `examples/chat.py` | **Baru** — interactive chat client via HTTP API |
-| `newpublic_BETA.py` | **Dihapus** |
-| `CHANGELOG.md` | Entri ini |
-
----
-
-
-
-### Changes
-
-#### `PublicForward/ForVPS/vps_server.py` — `/v1/models` endpoint
-
-- `owned_by` changed from `"deepseek"` to `"PAF-ai"`
-- Removed unused fields: `created`, `permission`, `root`, `parent`
-- Response `data` now sourced from `worker_mgr.list_all_accounts()` (live
-  accounts from connected workers) instead of `MODEL_ALIASES.keys()`
-- Removed extra `"accounts"` field from response root (not part of OpenAI spec)
-
-New response shape:
+**Response:**
 ```json
 {
   "object": "list",
@@ -412,208 +82,676 @@ New response shape:
 }
 ```
 
-#### `API_USAGE.md`
-
-- Updated `/v1/models` response example to match new format
-- Removed `created` field from example
-- Updated `owned_by` from `"deepseek"` to `"PAF-ai"`
-- Updated notes section
-
-### Files Changed
-
-| File | Change |
-|------|--------|
-| `PublicForward/ForVPS/vps_server.py` | `/v1/models` — simplified response, `owned_by` → `"PAF-ai"` |
-| `API_USAGE.md` | Updated `/v1/models` example and notes |
-| `CHANGELOG.md` | Added this entry |
+**Notes:**
+- Each entry represents a logged-in DeepSeek browser account registered to a worker
+- The `id` field is the account name — use it with `preferred_account` to route requests to a specific account
+- `owned_by` is always `"PAF-ai"`
 
 ---
 
-## [2.0.4] 2026-06-26 — Fix CONTINUE mode stale response + send button DOM
+### 3. Chat Completions (Main API)
+**POST** `/v1/chat/completions`
 
-### Bug Fixes
+Send a message to DeepSeek and get a response.
 
-#### CONTINUE mode: scraper returned old response instead of new one
+#### Basic Request
 
-**Root cause (three layers):**
-
-1. `_read_latest_response()` always used `nth(count - 1)` (the last element on
-   page). In CONTINUE mode the page already has N old `div.ds-markdown`
-   elements. When polling began, `nth(count - 1)` pointed to the last *old*
-   response — which was already stable — so `wait_for_response` hit
-   `stability_polls` immediately and returned the stale text before the new
-   response had even started streaming.
-
-2. `wait_for_response()` had no notion of how many responses existed before the
-   prompt was sent. It could not distinguish "old stable response" from "new
-   stable response".
-
-3. `send_prompt()` called `_select_model_tab()` and `_set_toggle()` in CONTINUE
-   mode, but DeepSeek hides the mode pills and tool toggles once a conversation
-   is in progress. These calls would time out waiting for DOM elements that no
-   longer exist, wasting seconds and producing warning logs on every CONTINUE
-   request.
-
-**Fix (`scrapers/base_scraper.py`):**
-
-- Added `_count_response_elements() -> int`:
-  Counts `div.ds-markdown` elements currently on page using the same selector
-  chain as `_response_selectors()`. Called immediately **before** `send_prompt`
-  to snapshot the baseline.
-
-- `wait_for_response()` gains `initial_response_count: int = 0` parameter:
-  Passed through to `_read_latest_response()` as `skip_count`. Defaults to 0
-  so NEW mode behaviour is completely unchanged.
-
-- `_read_latest_response()` gains `skip_count: int = 0` parameter:
-  Now guards `count > skip_count` before reading. If the new response has not
-  yet appeared (count is still at baseline), returns `""` — keeping
-  `stable_count` at 0 and forcing the loop to keep waiting. Once the new
-  element appears (`count > skip_count`), reads `nth(count - 1)` as before.
-
-- `scrape()` snapshots baseline before `send_prompt` and passes it to
-  `wait_for_response`.
-
-**Fix (`scrapers/deepseek_scraper.py`):**
-
-- `send_prompt()`: mode/tool selection (`_select_model_tab`, `_set_toggle`)
-  is now gated to `mode == "new"` only. In CONTINUE mode these controls are
-  absent from the DOM; skipping them eliminates spurious timeouts and log
-  warnings. A `log.debug` note is emitted instead.
-
-#### Send button DOM selectors (config.py)
-
-**Root cause:**
-Send button was identified by `div.ds-icon-button._7436101` where `_7436101`
-is a minified hash that changes between DeepSeek builds. The selector was
-already stale; the button was being found (if at all) only via the
-`div[role="button"][aria-disabled="false"]:has(svg)` fallback.
-
-**Verified DOM structure (June 2026):**
+```bash
+curl -X POST http://16.79.2.204:9000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-chat",
+    "messages": [
+      {"role": "user", "content": "What is quantum computing?"}
+    ]
+  }'
 ```
-<div class="bf38813a">                         ← parent container
-  <button class="ds-button ds-button--primary
-                 ds-button--filled ds-button--circle
-                 ds-button--m ds-button--icon-relative-m
-                 _52c986b">                    ← ACTIVE: no ds-button--disabled
-    <div class="ds-button__background"/>
-    …svg icon…
-  </button>
-</div>
+
+#### Request Body Schema
+
+```json
+{
+  "model": "deepseek-chat",          // Required: Always "deepseek-chat"
+  "messages": [                       // Required: Array of message objects
+    {
+      "role": "user",                 // Required: "user", "assistant", or "system"
+      "content": "Your message here"  // Required: Message content
+    }
+  ],
+  
+  // Optional parameters:
+  "preferred_account": "account2",    // Route to specific account (with fallback)
+  "session_id": "my-session",         // Enable session persistence
+  "mode": "new",                      // "new" or "continue" (requires session_id)
+  "think_mode": "thinking",           // DeepSeek mode alias (see table below)
+  "model_tab": "expert",              // Direct tab selection: "instant", "expert", or "vision"
+  "deep_think": true,                 // Enable/disable DeepThink toggle
+  "search": false,                    // Enable/disable search toggle
+  "attachments": [                    // File uploads (Base64)
+    {
+      "filename": "data.csv",
+      "data": "base64-encoded-content...",
+      "mime_type": "text/csv"
+    }
+  ],
+  "stream": false                     // Must be false (streaming not supported)
+}
 ```
-Inactive (streaming / empty input) adds `ds-button--disabled bd74640a` to the
-button class list.
 
-**Fix (`config.py`) — new `send_button` selector priority:**
+#### think_mode Aliases
 
-| # | Selector | Notes |
-|---|----------|-------|
-| 1 | `.bf38813a .ds-button--circle.ds-button--primary:not(.ds-button--disabled)` | Most precise — scoped to container |
-| 2 | `.ds-button--circle.ds-button--primary.ds-button--filled:not(.ds-button--disabled)` | No container scope, still stable |
-| 3 | `.ds-button--circle:not(.ds-button--disabled):has(.ds-button__background)` | Broader fallback |
-| 4 | `div[role="button"][aria-disabled="false"]:has(svg)` | Legacy (pre-v2.0.4) |
-| 5 | `div.ds-icon-button[aria-disabled="false"]` | Legacy |
-| 6 | `button[type="submit"]` | Last-resort semantic fallback |
+Simplify mode selection with these aliases:
 
-Active/inactive distinction is now done via `:not(.ds-button--disabled)` —
-no longer depends on `aria-disabled` or minified class hashes.
+| think_mode | → Mode | → DeepThink | → Search | Notes |
+|------------|--------|-------------|----------|-------|
+| `"instant"` / `"fast"` | Instant | `false` | `false` | Default mode, fastest response |
+| `"thinking"` / `"deep"` | Expert | `true` | `false` | Expert mode + DeepThink tool |
+| `"expert"` / `"reasoning"` | Expert | `true` | `false` | Alias for `"thinking"` |
+| `"search"` | Instant | `false` | `true` | Instant mode + Search tool |
+| `"vision"` | Vision | `false` | `false` | Vision/OCR mode |
 
-Minified hashes `_52c986b` and `bf38813a` are documented as volatile in
-comments.
+> **Important — Tool Availability per Mode:**
+> DeepSeek enforces which tools are available depending on the active mode:
+>
+> | Mode | DeepThink | Search |
+> |------|-----------|--------|
+> | Instant | ✅ Available | ✅ Available |
+> | Expert | ✅ Available | ❌ Not available (hidden in UI) |
+> | Vision | ✅ Available | ❌ Not available (hidden in UI) |
+>
+> The scraper enforces this matrix automatically — requesting `search: true` on
+> Expert or Vision mode is silently ignored (no error, no warning).
+> 
+> **Why `"search"` maps to Instant mode:** The Search tool is only available
+> on Instant mode. Using `"search"` alias automatically selects Instant to
+> ensure the Search tool can be activated.
 
-### Files Changed
+**Example with think_mode:**
+```bash
+curl -X POST http://16.79.2.204:9000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-chat",
+    "messages": [{"role": "user", "content": "Explain quantum entanglement"}],
+    "think_mode": "thinking"
+  }'
+```
 
-| File | Change |
-|------|--------|
-| `scrapers/base_scraper.py` | Added `_count_response_elements()`, updated `wait_for_response()` + `_read_latest_response()` signatures, snapshot in `scrape()` |
-| `scrapers/deepseek_scraper.py` | `send_prompt()` skips mode/tool selection in CONTINUE mode |
-| `config.py` | `send_button` selectors replaced with verified June 2026 DOM selectors |
-| `CHANGELOG.md` | Restored file (was accidentally overwritten in a prior commit); added v2.0.3 and v2.0.4 entries |
+#### Response Format
 
----
+```json
+{
+  "id": "req-abc123def456",
+  "object": "chat.completion",
+  "created": 1719374917,
+  "model": "deepseek-chat",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Quantum computing is a type of computing that uses quantum-mechanical phenomena..."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0
+  },
+  "x_meta": {
+    "session_id": "my-session",
+    "account_name": "account1",
+    "conversation_url": "https://chat.deepseek.com/chat/abc123",
+    "model_tab": "expert",
+    "deep_think": true,
+    "search": false,
+    "worker_id": "worker-DESKTOP-ABC123-001",
+    "processing_time_ms": 3245
+  }
+}
+```
 
-## [2.0.3] 2026-06-26 — Fix think_mode alias + mode selector strategy
+#### Response Headers
 
-### Bug Fixes
+Additional metadata is available in response headers:
 
-#### think_mode alias: "search" routed to Expert instead of Instant
-
-**Root cause (`PublicForward/ForVPS/vps_server.py`):**
-`THINK_MODE_ALIASES` was missing the `"search"` key entirely. VPS fell through
-to a default that mapped it to Expert mode. Search tool is only available on
-Instant — so `web_search=True` was silently ignored every request.
-Also missing: `"deep"` alias for Expert mode.
-
-**Fix:**
-- `"search"` → Instant mode + `web_search=True`
-- `"deep"` → Expert mode + `deep_think=True`
-- `"auto"` / `"instant"` / `"fast"` → Instant, no tools
-- `"thinking"` / `"expert"` / `"reasoning"` → Expert + DeepThink
-- `"vision"` → Vision, no tools
-
-#### Mode selector timed out (matched `<html>` root)
-
-**Root cause (`config.py`):**
-Mode pills were selected with `':has-text("Instant") >> nth=0'`. Playwright's
-`:has-text()` without scope matches all ancestor elements including `<html>`.
-`nth=0` therefore returned the root element, which was never interactable →
-timeout on every request.
-
-**Fix:**
-Replaced with ordered fallback selector stack per mode:
-1. `:text-is("Instant")` — Playwright exact-text, no ancestor bleed
-2. `div:has-text("Instant"):not(:has(div))` — leaf-div fallback
-3. `div[class*="tab"]:has-text("Instant")` — class-fragment fallback
-4. `button:has-text("Instant")` — semantic button fallback
-5. `div[role="tab"]:has-text("Instant")` — ARIA fallback
-
-Added `get_by_text(label, exact=True) → locator('..') → click parent`
-fallback in `_select_model_tab()` for when all CSS selectors miss.
-
-Added `_is_active_by_class_count()`: compares CSS class count of target
-pill vs its siblings. Active pill has one extra minified class; inactive
-siblings have fewer. Robust to minified class name changes.
-
-### Files Changed
-
-| File | Change |
-|------|--------|
-| `config.py` | Mode selectors rewritten; `tab_toggle_matrix` filled; terminology updated |
-| `scrapers/deepseek_scraper.py` | `_select_model_tab()` fallback; `_is_active_by_class_count()`; terminology |
-| `PublicForward/ForVPS/vps_server.py` | `THINK_MODE_ALIASES` fixed; version → 2.0.3 |
-| `CHANGELOG.md` | Added this entry |
-| `API_USAGE.md` | Corrected `think_mode` table; added Tool Availability info box; added Example 4b |
-
-### Version comparison
-
-| Feature | v2.0.2 | v2.0.3 | v2.0.4 | v2.0.5 | v2.1.0 |
-|---------|--------|--------|--------|--------|--------|
-| Tab selection | `:has-text >> nth=0` (broken) | `:text-is()` + fallbacks | — | — | — |
-| Tool matrix | TODO placeholder | Confirmed matrix | — | — | — |
-| `think_mode` aliases | Incomplete, "search" wrong | All aliases correct | — | — | — |
-| Send button selector | `_7436101` (stale hash) | — | Stable `ds-button--` classes | — | — |
-| CONTINUE mode response | Returns old response | — | Anchored to post-send count | — | — |
-| CONTINUE mode DOM calls | Mode/tool selectors called | — | Skipped (controls hidden) | — | — |
-| `/v1/models` `owned_by` | `"deepseek"` | — | — | `"PAF-ai"` | — |
-| `/v1/models` fields | Full OpenAI schema | — | — | Minimal `id/object/owned_by` | — |
-| `/v1/models` data source | `MODEL_ALIASES.keys()` | — | — | `list_all_accounts()` | — |
-| Session TTL | ❌ | — | — | — | ✅ 3600s, configurable |
-| Session disk restore | ❌ | — | — | — | ✅ `load_from_disk()` |
-| Account pinning (CONTINUE) | ❌ | — | — | — | ✅ `Session.account` |
-| Turn 2 tool-result | ❌ | — | — | — | ✅ `scrape_with_tool_result()` |
-| CONTINUE bug: prompt ke new chat | ❌ Bug | — | — | — | ✅ Fixed (5 root causes) |
-| `_ensure_page_ready()` URL check | ❌ | — | — | — | ✅ Sanity check + fallback |
-| `is_session_expired()` false positive | ❌ `:has-text("Log in")` | — | — | — | ✅ `input[type=password]` visible |
-| `_rotate_account()` reset flag | ❌ | — | — | — | ✅ Reset `_conversation_started` |
-| Background cleanup loop | ❌ | — | — | — | ✅ Setiap 60 detik |
-| Skip-goto optimisation | ❌ | — | — | — | ✅ URL compare sebelum goto |
-| `pool.release(reset=)` | ❌ | — | — | — | ✅ CONTINUE jaga page hidup |
-| CLI `--mode continue` | ❌ Selalu buka chat baru | — | — | — | ✅ Simpan + muat URL |
-| `examples/chat.py` | ❌ | — | — | — | ✅ Interactive API client |
-| `newpublic_BETA.py` | ✅ Ada | — | — | — | 🗑️ Dihapus |
+```http
+X-Session-ID: my-session
+X-Account-Name: account1
+X-Conversation-URL: https://chat.deepseek.com/chat/abc123
+```
 
 ---
 
-## [2.0.2] and earlier
+## 🎯 Usage Examples
 
-See git history (`git log --oneline`) for changes prior to v2.0.3.
+### Example 1: Simple Question
+
+```bash
+curl -X POST http://16.79.2.204:9000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-chat",
+    "messages": [
+      {"role": "user", "content": "What is 2+2?"}
+    ]
+  }'
+```
+
+**Response:**
+```json
+{
+  "id": "req-001",
+  "object": "chat.completion",
+  "created": 1719374917,
+  "model": "deepseek-chat",
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "content": "2 + 2 equals 4."
+    },
+    "finish_reason": "stop"
+  }],
+  "x_meta": {
+    "session_id": null,
+    "account_name": "account1",
+    "conversation_url": "https://chat.deepseek.com/chat/xyz",
+    "model_tab": "instant",
+    "deep_think": false
+  }
+}
+```
+
+---
+
+### Example 2: Preferred Account Routing
+
+```bash
+curl -X POST http://16.79.2.204:9000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-chat",
+    "messages": [
+      {"role": "user", "content": "Hello"}
+    ],
+    "preferred_account": "account2"
+  }'
+```
+
+**Behavior:**
+- Attempts to route to `account2`
+- Falls back to any available account if `account2` is busy
+- Response includes actual account used in `x_meta.account_name`
+
+---
+
+### Example 3: Session Persistence (NEW + CONTINUE)
+
+#### Step 1: Create New Session
+
+```bash
+curl -X POST http://16.79.2.204:9000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-chat",
+    "messages": [
+      {"role": "user", "content": "What is 5 + 3?"}
+    ],
+    "session_id": "math-session",
+    "mode": "new"
+  }'
+```
+
+**Response:**
+```json
+{
+  "choices": [{
+    "message": {
+      "content": "5 + 3 equals 8."
+    }
+  }],
+  "x_meta": {
+    "session_id": "math-session",
+    "conversation_url": "https://chat.deepseek.com/chat/abc123"
+  }
+}
+```
+
+#### Step 2: Continue Session
+
+```bash
+curl -X POST http://16.79.2.204:9000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-chat",
+    "messages": [
+      {"role": "user", "content": "Multiply that by 2"}
+    ],
+    "session_id": "math-session",
+    "mode": "continue"
+  }'
+```
+
+**Response:**
+```json
+{
+  "choices": [{
+    "message": {
+      "content": "8 multiplied by 2 equals 16."
+    }
+  }],
+  "x_meta": {
+    "session_id": "math-session",
+    "conversation_url": "https://chat.deepseek.com/chat/abc123"
+  }
+}
+```
+
+**Note:** The worker navigates to the saved conversation URL and continues the context.
+
+---
+
+### Example 4: Deep Thinking Mode (Expert)
+
+```bash
+curl -X POST http://16.79.2.204:9000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-chat",
+    "messages": [
+      {"role": "user", "content": "Explain the Riemann Hypothesis"}
+    ],
+    "think_mode": "thinking"
+  }'
+```
+
+**Behavior:**
+- Switches to **Expert** mode with **DeepThink** tool enabled
+- DeepSeek will show its reasoning process
+- Search tool is **not available** on Expert mode — silently ignored even if set
+- Response includes full reasoning + answer
+
+---
+
+### Example 4b: Search Mode (Instant + Search)
+
+```bash
+curl -X POST http://16.79.2.204:9000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-chat",
+    "messages": [
+      {"role": "user", "content": "What are today's latest AI news?"}
+    ],
+    "think_mode": "search"
+  }'
+```
+
+**Behavior:**
+- Uses **Instant** mode with **Search** tool enabled
+- DeepSeek accesses the internet for up-to-date information
+- Search tool is **only available** on Instant mode, so the alias auto-selects it
+
+---
+
+### Example 5: File Upload (Attachments)
+
+```bash
+# First, encode your file to base64
+FILE_BASE64=$(base64 -w 0 data.csv)
+
+curl -X POST http://16.79.2.204:9000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"model\": \"deepseek-chat\",
+    \"messages\": [
+      {\"role\": \"user\", \"content\": \"Analyze this CSV file\"}
+    ],
+    \"attachments\": [
+      {
+        \"filename\": \"data.csv\",
+        \"data\": \"$FILE_BASE64\",
+        \"mime_type\": \"text/csv\"
+      }
+    ]
+  }"
+```
+
+**Supported MIME types:**
+- `text/csv`, `text/plain`, `text/markdown`
+- `application/pdf`, `application/json`
+- `image/png`, `image/jpeg`, `image/gif`
+
+---
+
+### Example 6: Python Client
+
+```python
+import requests
+
+BASE_URL = "http://16.79.2.204:9000"
+
+def chat(message: str, session_id: str = None, mode: str = "new"):
+    payload = {
+        "model": "deepseek-chat",
+        "messages": [{"role": "user", "content": message}]
+    }
+    
+    if session_id:
+        payload["session_id"] = session_id
+        payload["mode"] = mode
+    
+    response = requests.post(
+        f"{BASE_URL}/v1/chat/completions",
+        json=payload
+    )
+    
+    data = response.json()
+    return data["choices"][0]["message"]["content"]
+
+# Usage
+print(chat("What is AI?"))
+
+# With session
+print(chat("What is 10 + 5?", session_id="calc", mode="new"))
+print(chat("Multiply by 3", session_id="calc", mode="continue"))
+```
+
+---
+
+### Example 7: OpenAI Python SDK Compatible
+
+```python
+# PAF-ModelDeepSeek is OpenAI-compatible!
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://16.79.2.204:9000/v1",
+    api_key="not-needed"  # No auth required
+)
+
+response = client.chat.completions.create(
+    model="deepseek-chat",
+    messages=[
+        {"role": "user", "content": "Hello!"}
+    ]
+)
+
+print(response.choices[0].message.content)
+```
+
+---
+
+## ⚠️ Error Responses
+
+### 400 Bad Request
+```json
+{
+  "error": {
+    "message": "Streaming is not supported",
+    "type": "invalid_request_error",
+    "code": "streaming_not_supported"
+  }
+}
+```
+
+**Causes:**
+- `stream: true` was set (not supported)
+- Missing required fields (`model`, `messages`)
+- Invalid JSON format
+
+---
+
+### 401 Unauthorized
+```json
+{
+  "error": {
+    "message": "Authentication required",
+    "type": "authentication_error",
+    "code": "invalid_auth"
+  }
+}
+```
+
+**Cause:** Worker authentication failed (internal, rare)
+
+---
+
+### 429 Too Many Requests
+```json
+{
+  "error": {
+    "message": "Account rate-limited by DeepSeek",
+    "type": "rate_limit_error",
+    "code": "rate_limit_exceeded"
+  }
+}
+```
+
+**Causes:**
+- DeepSeek rate limit hit for the account
+- Too many requests in short time
+
+**Solution:** Wait a few minutes or use a different account via `preferred_account`
+
+---
+
+### 500 Internal Server Error
+```json
+{
+  "error": {
+    "message": "Browser crashed during task execution",
+    "type": "internal_error",
+    "code": "browser_error"
+  }
+}
+```
+
+**Causes:**
+- Browser crash
+- Unexpected page behavior
+- Network issues
+
+**Solution:** Retry the request
+
+---
+
+### 503 Service Unavailable
+```json
+{
+  "error": {
+    "message": "No available workers",
+    "type": "service_unavailable_error",
+    "code": "no_workers"
+  }
+}
+```
+
+**Cause:** No workers connected to VPS
+
+**Solution:** Start at least one worker
+
+---
+
+### 504 Gateway Timeout
+```json
+{
+  "error": {
+    "message": "No available worker within timeout",
+    "type": "timeout_error",
+    "code": "worker_timeout"
+  }
+}
+```
+
+**Cause:** All workers busy, 60-second timeout exceeded
+
+**Solution:** 
+- Add more workers
+- Reduce request rate
+- Retry after a moment
+
+---
+
+## 🔍 Monitoring
+
+### Check System Status
+
+```bash
+# Quick health check
+curl http://16.79.2.204:9000/health | jq '.status'
+
+# Worker count
+curl http://16.79.2.204:9000/health | jq '.workers.total_workers'
+
+# Available accounts
+curl http://16.79.2.204:9000/v1/models | jq '.data[].id'
+
+# Busy slots
+curl http://16.79.2.204:9000/health | jq '.workers.busy_slots'
+```
+
+### Monitor Response Times
+
+Check `x_meta.processing_time_ms` in responses:
+
+```bash
+curl -X POST http://16.79.2.204:9000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"Hi"}]}' \
+  | jq '.x_meta.processing_time_ms'
+```
+
+---
+
+## 🎓 Best Practices
+
+### 1. Session Management
+- Use unique `session_id` for each conversation thread
+- Always use `mode: "new"` for the first message
+- Use `mode: "continue"` for follow-up messages
+- Session files are stored in `data/sessions/` on workers
+
+### 2. Account Routing
+- Use `preferred_account` to distribute load across specific accounts
+- System automatically falls back if preferred account is busy
+- Check `x_meta.account_name` to see which account was used
+
+### 3. Error Handling
+- Implement retry logic for 429, 500, 504 errors
+- Exponential backoff recommended
+- Log `x_meta.worker_id` for debugging
+
+### 4. Performance
+- Expected response times: 2-10 seconds depending on query complexity
+- DeepThink mode takes longer (10-30 seconds)
+- Vision mode with images takes 5-15 seconds
+
+### 6. Mode & Tool Constraints
+- **Instant mode**: Both tools available — DeepThink and Search
+- **Expert mode**: Only DeepThink tool available — Search is hidden in UI
+- **Vision mode**: Only DeepThink tool available — Search is hidden in UI
+- Setting `"search": true` with `model_tab: "expert"` or `"vision"` is safe —
+  the scraper silently ignores it (no error returned)
+
+### 5. Rate Limits
+- DeepSeek enforces per-account rate limits
+- Use multiple accounts to increase throughput
+- Monitor for 429 errors and back off
+
+---
+
+## 📊 Response Metadata Fields
+
+All responses include an `x_meta` object with detailed information:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `session_id` | string/null | Session identifier if persistence enabled |
+| `account_name` | string | Which DeepSeek account was used |
+| `conversation_url` | string | DeepSeek conversation URL (for debugging) |
+| `model_tab` | string | Tab used: "instant", "expert", or "vision" |
+| `deep_think` | boolean | Whether DeepThink was enabled |
+| `search` | boolean | Whether search was enabled |
+| `worker_id` | string | Which worker processed the request |
+| `processing_time_ms` | integer | Time taken to process (milliseconds) |
+
+---
+
+## 🔗 Integration Examples
+
+### cURL + jq
+```bash
+RESPONSE=$(curl -s -X POST http://16.79.2.204:9000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"Hi"}]}')
+
+echo $RESPONSE | jq -r '.choices[0].message.content'
+echo $RESPONSE | jq -r '.x_meta.account_name'
+```
+
+### JavaScript/Node.js
+```javascript
+const axios = require('axios');
+
+async function chat(message) {
+  const response = await axios.post('http://16.79.2.204:9000/v1/chat/completions', {
+    model: 'deepseek-chat',
+    messages: [{role: 'user', content: message}]
+  });
+  
+  return response.data.choices[0].message.content;
+}
+
+chat('Hello!').then(console.log);
+```
+
+### Python with Requests
+```python
+import requests
+
+def chat(message, **kwargs):
+    payload = {
+        "model": "deepseek-chat",
+        "messages": [{"role": "user", "content": message}],
+        **kwargs
+    }
+    
+    r = requests.post("http://16.79.2.204:9000/v1/chat/completions", json=payload)
+    return r.json()["choices"][0]["message"]["content"]
+
+# Simple usage
+print(chat("What is AI?"))
+
+# With options
+print(chat("Explain quantum physics", think_mode="thinking"))
+```
+
+---
+
+## 📚 Additional Resources
+
+- **UPDATE_NOTES.md** - Complete feature documentation
+- **DEPLOYMENT_GUIDE.md** - Setup and deployment instructions
+- **CHANGELOG.md** - Version history and changes
+- **HOTFIX_v2.0.1.md** - CLI event loop fix
+- **HOTFIX_v2.0.2.md** - Browser close method fix
+
+---
+
+## 🆘 Support
+
+For issues or questions:
+1. Check `/health` endpoint for system status
+2. Review worker logs for detailed error messages
+3. Check `x_meta` fields in responses for debugging info
+4. Consult the DEPLOYMENT_GUIDE.md for troubleshooting
+
+---
+
+**Version**: 2.0.3  
+**Last Updated**: June 26, 2026  
+**Base URL**: http://16.79.2.204:9000
