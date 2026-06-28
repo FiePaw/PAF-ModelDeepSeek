@@ -5,15 +5,51 @@ Format: `[version] YYYY-MM-DD — summary`
 
 ---
 
-## [2.2.1] 2026-06-28 — Critical bug fixes: mode=new response timeout + CONTINUE mode reliability
+## [2.2.1] 2026-06-28 — Critical bug fixes: mode=new timeout, CONTINUE reliability, Skip goto() after restart
 
-Rilis ini memperbaiki **5 bug** yang ditemukan setelah optimasi v2.2.0: satu bug
-kritis pada scraper (mode=new timeout 300s karena response baseline salah) dan
+Rilis ini memperbaiki **7 bug** yang ditemukan setelah optimasi v2.2.0: satu bug
+kritis pada scraper (mode=new timeout 300s karena response baseline salah),
 empat bug pada pipeline session CONTINUE (mode tidak pernah benar-benar aktif
 di sisi client, server fallback tanpa notifikasi, dan metadata response tidak
-lengkap). Ditambahkan juga `chatCLI.py` — interactive CLI untuk testing API.
+lengkap), dan dua bug pada browser pool navigation setelah worker restart.
+Ditambahkan juga `chatCLI.py` — interactive CLI untuk testing API.
 
 ### Bug Fixes
+
+#### `browser_pool.py` — Skip goto() false positive after restart (CRITICAL)
+- **Root cause:** Perbandingan URL menggunakan bidirectional substring check:
+  ```python
+  already_there = (
+      conversation_url in current_url
+      or current_url in conversation_url  # ← FALSE POSITIVE
+  )
+  ```
+  Setelah worker restart, browser persistent profile biasanya membuka
+  homepage (`https://chat.deepseek.com/`). Karena homepage URL adalah
+  substring dari setiap conversation URL, check `current_url in
+  conversation_url` selalu **True** → `Skip goto()` salah fire.
+- **Dampak:** Browser tetap di homepage, bukan conversation page. Prompt
+  dikirim ke chat kosong → response tanpa context percakapan sebelumnya.
+  User melihat seolah session "tidak terestored" padahal session data
+  tersimpan dengan benar di disk.
+- **Fix:** Diganti dengan `_urls_match()` helper yang melakukan normalised
+  path comparison via `urllib.parse`. Dua URL dianggap match hanya jika
+  path-nya identik setelah stripping scheme/host/trailing-slash/query.
+  Homepage (path kosong) **tidak pernah** match conversation URL.
+- Diterapkan di **kedua** method: `run_task()` dan
+  `run_task_with_tool_result()`.
+
+#### `browser_pool.py` — Missing SPA ready check on Skip goto()
+- **Root cause:** Saat `Skip goto()` fire, `_wait_for_spa_ready()` tidak
+  dipanggil. Hanya dipanggil di branch `else` (saat `page.goto()` benar-
+  benar dilakukan).
+- **Dampak:** Setelah restart, meskipun URL match benar (persistent profile
+  membuka conversation URL yang tepat), DOM mungkin belum selesai hydrating.
+  `_count_response_elements()` bisa return 0 → baseline salah →
+  `wait_for_response()` membaca response lama sebagai response baru.
+- **Fix:** `_wait_for_spa_ready()` sekarang dipanggil di **kedua** branch
+  (Skip goto dan normal goto), memastikan SPA selalu ter-hydrate sebelum
+  `scrape()` berjalan.
 
 #### `scrapers/base_scraper.py` — Response baseline ordering fix (CRITICAL)
 - **Root cause:** `scrape()` mengambil snapshot `initial_response_count` dari
@@ -98,6 +134,7 @@ lengkap). Ditambahkan juga `chatCLI.py` — interactive CLI untuk testing API.
 
 | File | Change |
 |------|--------|
+| `browser_pool.py` | Fix Skip goto() false positive + add SPA ready check |
 | `scrapers/base_scraper.py` | Fix response baseline ordering for mode=new |
 | `chatCLI.py` | New file — interactive CLI test tool |
 | `public.py` | Add `mode_fallback` flag on session fallback |
@@ -105,12 +142,16 @@ lengkap). Ditambahkan juga `chatCLI.py` — interactive CLI untuk testing API.
 | `API_USAGE.md` | Updated response metadata docs |
 
 ### Impact
+- **Skip goto() false positive dieliminasi** — setelah restart, browser
+  sekarang selalu navigasi ke conversation URL yang benar. Homepage tidak
+  lagi salah match sebagai conversation page.
 - **mode=new timeout bug dieliminasi** — scraper sekarang selalu menggunakan
   baseline 0 untuk mode new, memastikan `wait_for_response()` langsung
   menangkap response baru.
-- **Session CONTINUE sekarang reliable** — auto-capture session_id,
-  `first_message_sent` hanya di-set setelah sukses, dan mode fallback
-  ter-notifikasi ke client.
+- **Session CONTINUE sekarang reliable end-to-end** — auto-capture
+  session_id, `first_message_sent` hanya di-set setelah sukses, mode
+  fallback ter-notifikasi ke client, dan session benar-benar ter-restore
+  setelah worker restart.
 - Tidak ada breaking change pada API contract — field baru `mode` dan
   `mode_fallback` di `x_meta` bersifat additive (client lama mengabaikannya).
 

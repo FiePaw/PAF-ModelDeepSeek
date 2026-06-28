@@ -309,6 +309,45 @@ class BrowserPool:
         if any(s.status == SlotStatus.IDLE for s in self.slots):
             self._idle_event.set()
 
+    # ------------------------------------------------------------------ #
+    # URL comparison helper
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _urls_match(current_url: str, target_url: str) -> bool:
+        """
+        Check whether *current_url* points to the same conversation as
+        *target_url* using a normalised path comparison.
+
+        FIX: The old bidirectional substring check
+          ``current_url in conversation_url or conversation_url in current_url``
+        produced false positives when the browser was at the homepage
+        (e.g. ``https://chat.deepseek.com/``) because the homepage string
+        IS a substring of every conversation URL.
+
+        The new check strips the scheme, host, trailing slashes, and query
+        strings, then compares the path components.  Two URLs match only
+        when their path portions are identical (or one is empty — meaning
+        the browser is on the bare domain, which should NEVER be treated as
+        "already at the conversation").
+        """
+        from urllib.parse import urlparse
+
+        if not current_url or not target_url:
+            return False
+
+        cur = urlparse(current_url)
+        tgt = urlparse(target_url)
+
+        cur_path = cur.path.rstrip("/")
+        tgt_path = tgt.path.rstrip("/")
+
+        # An empty path means the browser is on the bare domain (homepage).
+        # This should NEVER match a conversation URL.
+        if not cur_path or not tgt_path:
+            return False
+
+        return cur_path == tgt_path
+
     async def _wait_for_spa_ready(
         self,
         scraper: "DeepSeekScraper",
@@ -395,16 +434,28 @@ class BrowserPool:
             if conversation_url and slot.scraper and slot.scraper.page:
                 current_url = slot.scraper.page.url or ""
                 # Skip-goto optimisation: already on that URL → no reload needed.
-                already_there = (
-                    conversation_url in current_url
-                    or current_url in conversation_url
-                )
+                # FIX: Use normalised exact-path comparison instead of
+                # bidirectional substring matching. The old check
+                #   current_url in conversation_url
+                # produced false positives when the browser was at the
+                # homepage ("https://chat.deepseek.com/") because that
+                # string IS a substring of every conversation URL.
+                # After a worker restart, the persistent profile often
+                # opens to the homepage, triggering the false positive
+                # and skipping the goto entirely → the prompt is sent to
+                # a blank new-chat page instead of the saved conversation.
+                already_there = self._urls_match(current_url, conversation_url)
                 if already_there:
                     log.info(
                         "Skip goto() — slot %d already at conversation URL", slot.index
                     )
                     # Signal scraper that a conversation is already in progress.
                     slot.scraper._conversation_started = True
+                    # FIX: Even when skipping goto, ensure the SPA is
+                    # hydrated. After a fresh restart the persistent
+                    # profile may have the right URL but the DOM hasn't
+                    # finished rendering the message history yet.
+                    await self._wait_for_spa_ready(slot.scraper, timeout_ms=10_000)
                 else:
                     log.info(
                         "CONTINUE: navigating slot %d to %s", slot.index, conversation_url
@@ -498,15 +549,15 @@ class BrowserPool:
 
             if conversation_url and slot.scraper and slot.scraper.page:
                 current_url = slot.scraper.page.url or ""
-                already_there = (
-                    conversation_url in current_url
-                    or current_url in conversation_url
-                )
+                # FIX: Use normalised exact-path comparison (same as run_task).
+                already_there = self._urls_match(current_url, conversation_url)
                 if already_there:
                     log.info(
                         "Tool Turn 2: skip goto() — slot %d already at URL", slot.index
                     )
                     slot.scraper._conversation_started = True
+                    # FIX: SPA ready check even when skipping goto.
+                    await self._wait_for_spa_ready(slot.scraper, timeout_ms=10_000)
                 else:
                     log.info(
                         "Tool Turn 2: navigating slot %d to %s",
