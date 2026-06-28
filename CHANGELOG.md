@@ -7,14 +7,36 @@ Format: `[version] YYYY-MM-DD — summary`
 
 ## [2.2.1] 2026-06-28 — Critical bug fixes: mode=new timeout, CONTINUE reliability, Skip goto() after restart
 
-Rilis ini memperbaiki **7 bug** yang ditemukan setelah optimasi v2.2.0: satu bug
-kritis pada scraper (mode=new timeout 300s karena response baseline salah),
-empat bug pada pipeline session CONTINUE (mode tidak pernah benar-benar aktif
-di sisi client, server fallback tanpa notifikasi, dan metadata response tidak
-lengkap), dan dua bug pada browser pool navigation setelah worker restart.
+Rilis ini memperbaiki **8 bug** yang ditemukan setelah optimasi v2.2.0: satu bug
+kritis pada scraper (mode=new timeout 300s karena response baseline salah), satu
+bug kritis pada response detection (CONTINUE mode ke-2+ timeout karena selector-
+baseline mismatch), empat bug pada pipeline session CONTINUE, dan dua bug pada
+browser pool navigation setelah worker restart.
 Ditambahkan juga `chatCLI.py` — interactive CLI untuk testing API.
 
 ### Bug Fixes
+
+#### `scrapers/base_scraper.py` — Selector-baseline mismatch on CONTINUE (CRITICAL)
+- **Root cause:** `_count_response_elements()` mengembalikan satu angka (int)
+  dari selector PERTAMA (`div.ds-markdown:last-of-type`). Angka ini dipakai
+  sebagai `skip_count` universal untuk SEMUA selector di `_read_latest_response()`.
+  Karena `:last-of-type` mencocokkan satu elemen per parent-wrapper, pada DOM
+  DeepSeek setiap response adalah anak tunggal → `:last-of-type` mencocokkan
+  **semua** response → count-nya SAMA dengan `div.ds-markdown` total.
+  `count > skip_count` menjadi `N > N` = **False** untuk semua selector →
+  response baru tidak pernah terdeteksi → **timeout 300 s** (response_chars=0).
+- **Kenapa first CONTINUE berhasil:** Setelah navigasi `page.goto()`, halaman
+  baru ter-load dan response count masih rendah. Pada CONTINUE ke-2 (Skip goto,
+  halaman sama), count meningkat dan `:last-of-type` count = total count →
+  mismatch muncul.
+- **Fix:** Tiga perubahan:
+  1. `_count_response_elements()` sekarang mengembalikan `dict[str, int]` —
+     per-selector baseline, bukan satu angka global.
+  2. `_read_latest_response()` menerima `baselines: dict[str, int]` dan
+     membandingkan setiap selector dengan baseline **-nya sendiri**.
+  3. `wait_for_response()` menerima `dict | int` (backward compatible).
+- Dipastikan `scrape_with_tool_result()` di `deepseek_scraper.py` juga kompatibel
+  (sudah menggunakan `_count_response_elements()` yang sekarang return dict).
 
 #### `browser_pool.py` — Skip goto() false positive after restart (CRITICAL)
 - **Root cause:** Perbandingan URL menggunakan bidirectional substring check:

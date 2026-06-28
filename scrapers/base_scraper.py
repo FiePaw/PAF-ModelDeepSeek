@@ -312,25 +312,35 @@ class BaseAIChatScraper(ABC):
     # ------------------------------------------------------------------ #
     # Response handling
     # ------------------------------------------------------------------ #
-    async def _count_response_elements(self) -> int:
+    async def _count_response_elements(self) -> dict[str, int]:
         """
-        Count how many assistant response elements currently exist on the page.
+        Snapshot how many response elements each selector currently matches.
 
-        Called immediately BEFORE send_prompt() to snapshot the baseline in
-        CONTINUE mode. The result is passed to wait_for_response() so it can
-        anchor to the NEW response instead of re-reading an old one.
+        Returns a dict ``{selector: count}`` so that wait_for_response /
+        _read_latest_response can use a **per-selector** baseline.
+
+        FIX: The old version returned a single int from the FIRST selector
+        (``div.ds-markdown:last-of-type``). Because :last-of-type matches one
+        element per parent wrapper, its count could EQUAL the total
+        ``div.ds-markdown`` count. Using that inflated number as a universal
+        skip_count meant ``count > skip_count`` was never True for any
+        selector → 300 s timeout.
+
+        By returning per-selector counts, each selector is compared with
+        its own baseline. A new response increments the count of at least one
+        selector, and the detection works regardless of DOM grouping.
         """
+        baselines: dict[str, int] = {}
         if self.page is None:
-            return 0
+            return baselines
         for sel in self._response_selectors():
             try:
                 count = await self.page.locator(sel).count()
-                if count >= 0:
-                    log.debug("Response element baseline count: %d (selector: %s)", count, sel)
-                    return count
+                baselines[sel] = count
             except Exception:
-                continue
-        return 0
+                baselines[sel] = 0
+        log.debug("Response baselines: %s", baselines)
+        return baselines
 
     async def wait_for_response(
         self,
@@ -339,7 +349,7 @@ class BaseAIChatScraper(ABC):
         stability_secs: float,
         stability_polls: int,
         poll_interval: float,
-        initial_response_count: int = 0,
+        initial_response_count: dict[str, int] | int = 0,
     ) -> str:
         """
         Wait until the AI response stops changing. The response is considered
@@ -347,14 +357,17 @@ class BaseAIChatScraper(ABC):
         consecutive polls. More robust than waiting for a loading indicator.
 
         Args:
-            initial_response_count: Number of assistant response elements that
-                existed on the page BEFORE the prompt was sent (snapshot taken
-                by _count_response_elements()). In CONTINUE mode the page
-                already has N old responses — we must wait until count > N
-                before reading, otherwise we immediately read an old stable
-                response and return it as if it were the new one.
-                Defaults to 0 (NEW mode: no prior responses on page).
+            initial_response_count: Per-selector baseline snapshot taken before
+                the prompt was sent.  Accepts either a ``dict[str, int]``
+                (per-selector, preferred) or a plain ``int`` for backward
+                compatibility (applied to every selector).
         """
+        # Normalise legacy int → per-selector dict
+        if isinstance(initial_response_count, int):
+            baselines = {sel: initial_response_count for sel in response_selectors}
+        else:
+            baselines = initial_response_count
+
         deadline = time.monotonic() + timeout
         last_text = ""
         stable_count = 0
@@ -362,7 +375,7 @@ class BaseAIChatScraper(ABC):
         while time.monotonic() < deadline:
             text = await self._read_latest_response(
                 response_selectors,
-                skip_count=initial_response_count,
+                baselines=baselines,
             )
             if text and text == last_text:
                 stable_count += 1
@@ -379,26 +392,29 @@ class BaseAIChatScraper(ABC):
     async def _read_latest_response(
         self,
         selectors: list[str],
-        skip_count: int = 0,
+        baselines: dict[str, int] | None = None,
     ) -> str:
         """
         Return the text of the latest assistant message, trying selectors in order.
 
         Args:
-            skip_count: Ignore the first N elements (the pre-existing responses
-                in CONTINUE mode). Only read elements at index >= skip_count.
-                In NEW mode this is 0 so behaviour is unchanged.
+            baselines: Per-selector baseline counts (from
+                _count_response_elements).  For each selector, only proceed
+                when the current count exceeds that selector's own baseline.
+                This prevents the inflated skip_count problem where a
+                :last-of-type selector produced the same number as the total
+                element count, making ``count > skip`` always False.
         """
         if self.page is None:
             return ""
+        baselines = baselines or {}
         for sel in selectors:
             try:
                 loc = self.page.locator(sel)
                 count = await loc.count()
-                # Guard: only proceed if there is at least one NEW element
-                # beyond the baseline snapshot. This prevents returning a
-                # stale old response before DeepSeek begins streaming.
-                if count > skip_count:
+                # Use this selector's OWN baseline, not a global number.
+                skip = baselines.get(sel, 0)
+                if count > skip:
                     text = await loc.nth(count - 1).inner_text()
                     if text and text.strip():
                         return text.strip()
@@ -602,14 +618,14 @@ class BaseAIChatScraper(ABC):
                 # prior responses). For CONTINUE mode, snapshot AFTER we know
                 # the page is stable (send_prompt does not navigate in CONTINUE).
                 if mode == "new":
-                    initial_response_count = 0
-                    log.debug("NEW mode: response baseline forced to 0 (fresh page)")
+                    initial_response_count = {}
+                    log.debug("NEW mode: response baseline forced to {} (fresh page)")
                     await self.send_prompt(prompt, mode=mode, **merged_kwargs)
                 else:
                     # CONTINUE: snapshot before send (page is not navigated).
                     initial_response_count = await self._count_response_elements()
                     log.debug(
-                        "CONTINUE mode: response baseline before send: %d element(s)",
+                        "CONTINUE mode: response baseline before send: %s",
                         initial_response_count,
                     )
                     await self.send_prompt(prompt, mode=mode, **merged_kwargs)

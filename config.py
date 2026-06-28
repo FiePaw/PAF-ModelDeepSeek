@@ -372,7 +372,7 @@ DEEPSEEK_CONFIG: dict = {
     # ------------------------------------------------------------------- #
     "timeouts": {
         "page_load": 60,
-        "response_wait": 300,
+        "response_wait": 60,
         "stability_check": 2.0,      # how long content must be unchanged
         # OPTIMISATION: stability tail = stability_polls * poll_interval.
         # Was 4 * 0.8 = 3.2s of dead time AFTER every answer finished.
