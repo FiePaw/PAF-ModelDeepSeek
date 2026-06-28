@@ -310,25 +310,18 @@ class BaseAIChatScraper(ABC):
         return True
 
     # ------------------------------------------------------------------ #
-    # Response handling
+    # Response handling — text-change detection (virtual-scroll safe)
     # ------------------------------------------------------------------ #
     async def _count_response_elements(self) -> dict[str, int]:
         """
         Snapshot how many response elements each selector currently matches.
 
-        Returns a dict ``{selector: count}`` so that wait_for_response /
-        _read_latest_response can use a **per-selector** baseline.
+        Retained for diagnostic purposes and backward-compat with
+        scrape_with_tool_result().  The primary wait loop (wait_for_response)
+        now uses TEXT-CHANGE detection instead of count comparison, making it
+        immune to virtual-scroll DOM recycling.
 
-        FIX: The old version returned a single int from the FIRST selector
-        (``div.ds-markdown:last-of-type``). Because :last-of-type matches one
-        element per parent wrapper, its count could EQUAL the total
-        ``div.ds-markdown`` count. Using that inflated number as a universal
-        skip_count meant ``count > skip_count`` was never True for any
-        selector → 300 s timeout.
-
-        By returning per-selector counts, each selector is compared with
-        its own baseline. A new response increments the count of at least one
-        selector, and the detection works regardless of DOM grouping.
+        Returns a dict ``{selector: count}``.
         """
         baselines: dict[str, int] = {}
         if self.page is None:
@@ -339,8 +332,103 @@ class BaseAIChatScraper(ABC):
                 baselines[sel] = count
             except Exception:
                 baselines[sel] = 0
-        log.debug("Response baselines: %s", baselines)
+        log.debug("Response baselines (diagnostic): %s", baselines)
         return baselines
+
+    async def _get_last_response_text(self, _diagnostic: bool = False) -> str:
+        """
+        Read the text content of the LAST visible AI response element.
+
+        Strategy (virtual-scroll aware, multiple fallbacks):
+          1. Selectors scoped inside known virtual-list containers.
+          2. Unscoped div.ds-markdown fallback (short conversations).
+          3. Any element with ds-markdown class fragment.
+
+        When _diagnostic=True, logs every selector's count for debugging.
+        Returns stripped inner text of last matching element, or "" if nothing found.
+        """
+        if self.page is None:
+            return ""
+
+        for sel in self._virtual_list_selectors():
+            try:
+                loc = self.page.locator(sel)
+                count = await loc.count()
+                if _diagnostic:
+                    log.info("[DIAG] selector=%r count=%d", sel, count)
+                if count > 0:
+                    text = await loc.nth(count - 1).inner_text()
+                    if text and text.strip():
+                        if _diagnostic:
+                            log.info("[DIAG] matched sel=%r text_len=%d preview=%r",
+                                     sel, len(text.strip()), text.strip()[:60])
+                        return text.strip()
+            except Exception as exc:
+                if _diagnostic:
+                    log.info("[DIAG] selector=%r exception=%s", sel, exc)
+                continue
+        return ""
+
+    async def _dump_dom_diagnostic(self) -> None:
+        """
+        Dump diagnostic info about the current DOM state for debugging
+        response detection failures.
+        """
+        if self.page is None:
+            return
+        log.info("[DIAG] === DOM DIAGNOSTIC START === url=%s", self.page.url)
+        # Check all candidate selectors
+        diag_selectors = [
+            ".ds-virtual-list-visible-items",
+            ".ds-virtual-list",
+            "div.ds-markdown",
+            "div[class*='ds-markdown']",
+            "div[class*='markdown']",
+            ".ds-virtual-list-visible-items div.ds-markdown",
+            ".ds-virtual-list-visible-items div[class*='ds-markdown']",
+            ".ds-virtual-list-visible-items > *",
+        ]
+        for sel in diag_selectors:
+            try:
+                count = await self.page.locator(sel).count()
+                log.info("[DIAG] selector=%r count=%d", sel, count)
+            except Exception as exc:
+                log.info("[DIAG] selector=%r error=%s", sel, exc)
+
+        # Dump partial DOM structure around virtual list
+        try:
+            snippet = await self.page.evaluate("""() => {
+                const vl = document.querySelector('.ds-virtual-list-visible-items');
+                if (vl) return '[VL] ' + vl.innerHTML.substring(0, 500);
+                const md = document.querySelector('div.ds-markdown');
+                if (md) return '[MD] ' + md.innerHTML.substring(0, 500);
+                return '[NONE] body classes: ' + document.body.className.substring(0,200);
+            }""")
+            log.info("[DIAG] DOM snippet: %s", snippet)
+        except Exception as exc:
+            log.info("[DIAG] DOM eval failed: %s", exc)
+        await self.take_debug_screenshot("dom_diagnostic")
+        log.info("[DIAG] === DOM DIAGNOSTIC END ===")
+
+    async def _capture_pre_send_text(self) -> str:
+        """
+        Capture the text of the current last response BEFORE sending a new prompt.
+
+        This snapshot is compared against poll results in wait_for_response()
+        to detect when a NEW response has appeared.  Using text comparison
+        instead of element counts makes detection immune to virtual-scroll DOM
+        recycling (where ``count`` stays constant because one element is removed
+        from the top while a new one is added at the bottom).
+
+        Returns ``""`` on a fresh page (NEW mode) — any non-empty text in the
+        poll loop will then be treated as the new response.
+        """
+        text = await self._get_last_response_text()
+        log.info(
+            "pre_send_text captured: len=%d preview=%r",
+            len(text), text[:80],
+        )
+        return text
 
     async def wait_for_response(
         self,
@@ -350,43 +438,98 @@ class BaseAIChatScraper(ABC):
         stability_polls: int,
         poll_interval: float,
         initial_response_count: dict[str, int] | int = 0,
+        pre_send_text: str = "",
     ) -> str:
         """
-        Wait until the AI response stops changing. The response is considered
-        complete when its text is non-empty AND unchanged for `stability_polls`
-        consecutive polls. More robust than waiting for a loading indicator.
+        Wait until the AI response stops changing.
 
-        Args:
-            initial_response_count: Per-selector baseline snapshot taken before
-                the prompt was sent.  Accepts either a ``dict[str, int]``
-                (per-selector, preferred) or a plain ``int`` for backward
-                compatibility (applied to every selector).
+        TEXT-CHANGE DETECTION (Bug #9 fix):
+        ─────────────────────────────────────
+        DeepSeek uses a virtual-scroll list (``ds-virtual-list``). Elements
+        outside the viewport are removed from the DOM entirely.  After several
+        exchanges the element count stays CONSTANT (one old element removed,
+        one new element added), so ``count > baseline`` is never True →
+        300 s timeout.
+
+        The new approach compares TEXT CONTENT instead of element counts:
+
+        1. ``pre_send_text`` — text of the last response BEFORE the prompt was
+           sent (captured by ``_capture_pre_send_text()`` in scrape()).
+        2. Poll ``_get_last_response_text()`` until the text changes from
+           ``pre_send_text`` to something new AND stable.
+        3. Stability: the text must remain identical for ``stability_polls``
+           consecutive polls before it is accepted (catches still-streaming
+           partial responses).
+
+        This is completely immune to:
+          • Virtual-scroll DOM recycling (count fluctuation)
+          • ``:last-of-type`` baseline mismatch
+          • DOM restructuring between exchanges
+
+        ``initial_response_count`` is accepted for backward compatibility but
+        is no longer used in the detection loop.
         """
-        # Normalise legacy int → per-selector dict
-        if isinstance(initial_response_count, int):
-            baselines = {sel: initial_response_count for sel in response_selectors}
-        else:
-            baselines = initial_response_count
-
         deadline = time.monotonic() + timeout
         last_text = ""
         stable_count = 0
+        _found_new = False
+        _poll_count = 0
+
+        log.info(
+            "wait_for_response START: pre_send_text len=%d preview=%r",
+            len(pre_send_text), pre_send_text[:60],
+        )
 
         while time.monotonic() < deadline:
-            text = await self._read_latest_response(
-                response_selectors,
-                baselines=baselines,
-            )
-            if text and text == last_text:
+            current_text = await self._get_last_response_text()
+            _poll_count += 1
+
+            # Log first few polls for visibility
+            if _poll_count <= 5 or _poll_count % 20 == 0:
+                log.info(
+                    "wait_for_response poll#%d: found_new=%s current_len=%d "
+                    "current_preview=%r",
+                    _poll_count, _found_new, len(current_text), current_text[:60],
+                )
+
+            # Phase 1: wait for the response text to differ from pre-send text.
+            if not _found_new:
+                if current_text and current_text != pre_send_text:
+                    _found_new = True
+                    log.info(
+                        "wait_for_response: NEW response detected at poll#%d "
+                        "(pre_send len=%d, current len=%d)",
+                        _poll_count, len(pre_send_text), len(current_text),
+                    )
+                    last_text = current_text
+                    stable_count = 1
+                # Still showing pre-send content or empty → keep waiting.
+                await asyncio.sleep(poll_interval)
+                continue
+
+            # Phase 2: response found — wait for it to stabilise.
+            if current_text == last_text:
                 stable_count += 1
                 if stable_count >= stability_polls:
-                    return text
+                    log.info(
+                        "wait_for_response: STABLE after %d polls (len=%d)",
+                        stable_count, len(current_text),
+                    )
+                    return current_text
             else:
-                stable_count = 0
-                last_text = text
+                stable_count = 1
+                last_text = current_text
+
             await asyncio.sleep(poll_interval)
 
-        log.warning("wait_for_response timed out after %.0fs", timeout)
+        log.warning(
+            "wait_for_response timed out after %.0fs (found_new=%s, polls=%d, text_len=%d)",
+            timeout, _found_new, _poll_count, len(last_text),
+        )
+        # Run DOM diagnostic to identify why detection failed.
+        await self._dump_dom_diagnostic()
+        # Final diagnostic read with full selector logging.
+        await self._get_last_response_text(_diagnostic=True)
         return last_text
 
     async def _read_latest_response(
@@ -395,32 +538,14 @@ class BaseAIChatScraper(ABC):
         baselines: dict[str, int] | None = None,
     ) -> str:
         """
-        Return the text of the latest assistant message, trying selectors in order.
+        Return the text of the latest assistant message.
 
-        Args:
-            baselines: Per-selector baseline counts (from
-                _count_response_elements).  For each selector, only proceed
-                when the current count exceeds that selector's own baseline.
-                This prevents the inflated skip_count problem where a
-                :last-of-type selector produced the same number as the total
-                element count, making ``count > skip`` always False.
+        Delegates to ``_get_last_response_text()`` which uses virtual-list
+        aware selectors.  The ``selectors`` and ``baselines`` parameters are
+        accepted for backward compatibility but are no longer used in the
+        detection logic.
         """
-        if self.page is None:
-            return ""
-        baselines = baselines or {}
-        for sel in selectors:
-            try:
-                loc = self.page.locator(sel)
-                count = await loc.count()
-                # Use this selector's OWN baseline, not a global number.
-                skip = baselines.get(sel, 0)
-                if count > skip:
-                    text = await loc.nth(count - 1).inner_text()
-                    if text and text.strip():
-                        return text.strip()
-            except Exception:
-                continue
-        return ""
+        return await self._get_last_response_text()
 
     # ------------------------------------------------------------------ #
     # Extraction / saving
@@ -607,26 +732,32 @@ class BaseAIChatScraper(ABC):
                         raise RuntimeError("Login failed and no account to rotate")
                 _t_auth = time.monotonic()
 
-                # Send the prompt first (which navigates for NEW mode).
-                # For NEW mode, send_prompt -> _ensure_page_ready -> _goto_new_chat()
-                # navigates to a fresh page BEFORE we can snapshot the baseline.
-                # Snapshotting BEFORE send_prompt would read the OLD page's response
-                # count (e.g. 3 from a previous CONTINUE session), causing
-                # wait_for_response to wait for count > 3 on a fresh page that
-                # only ever has 1 response -> 300s timeout.
-                # Fix: for NEW mode, baseline is always 0 (fresh page has no
-                # prior responses). For CONTINUE mode, snapshot AFTER we know
-                # the page is stable (send_prompt does not navigate in CONTINUE).
+                # --- TEXT-CHANGE DETECTION (Bug #9 fix) ----------------------
+                # DeepSeek uses virtual-scroll (ds-virtual-list). Elements
+                # outside the viewport are removed from the DOM, so element
+                # COUNTS stay constant even when a new response arrives (one
+                # old element is removed as one new one is added). Count-based
+                # detection therefore never fires → 300 s timeout.
+                #
+                # Fix: capture the text of the LAST visible response BEFORE
+                # sending the prompt, then wait for that text to CHANGE. This
+                # is completely immune to count fluctuations.
+                #
+                # For NEW mode the page is blank after _goto_new_chat(), so
+                # pre_send_text == "" and any non-empty text in the poll loop
+                # is immediately treated as the new response.
                 if mode == "new":
+                    pre_send_text = ""
                     initial_response_count = {}
-                    log.debug("NEW mode: response baseline forced to {} (fresh page)")
+                    log.debug("NEW mode: pre_send_text='', baseline={}")
                     await self.send_prompt(prompt, mode=mode, **merged_kwargs)
                 else:
-                    # CONTINUE: snapshot before send (page is not navigated).
+                    # CONTINUE: snapshot BOTH text and counts before sending.
+                    pre_send_text = await self._capture_pre_send_text()
                     initial_response_count = await self._count_response_elements()
                     log.debug(
-                        "CONTINUE mode: response baseline before send: %s",
-                        initial_response_count,
+                        "CONTINUE mode: pre_send_text len=%d, baseline=%s",
+                        len(pre_send_text), initial_response_count,
                     )
                     await self.send_prompt(prompt, mode=mode, **merged_kwargs)
                 _t_send = time.monotonic()
@@ -639,6 +770,7 @@ class BaseAIChatScraper(ABC):
                     stability_polls=t["stability_polls"],
                     poll_interval=t["poll_interval"],
                     initial_response_count=initial_response_count,
+                    pre_send_text=pre_send_text,
                 )
                 _t_wait = time.monotonic()
                 log.info(
@@ -695,6 +827,22 @@ class BaseAIChatScraper(ABC):
     def _response_selectors(self) -> list[str]:
         """Return the ordered list of selectors used to read AI responses."""
         ...
+
+    def _virtual_list_selectors(self) -> list[str]:
+        """
+        Return selectors for the virtual-scroll-aware response reader.
+
+        Default implementation reads ``virtual_list_response`` from config
+        (added alongside the standard selectors). Subclasses that do not use
+        DeepSeek's virtual list can override this to return ``_response_selectors()``.
+        """
+        try:
+            from config import DEEPSEEK_CONFIG
+            return DEEPSEEK_CONFIG["selectors"].get(
+                "virtual_list_response", self._response_selectors()
+            )
+        except Exception:
+            return self._response_selectors()
 
     # ------------------------------------------------------------------ #
     # Async context manager

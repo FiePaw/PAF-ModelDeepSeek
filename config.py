@@ -166,6 +166,18 @@ DEEPSEEK_CONFIG: dict = {
             "div.ds-markdown:last-of-type",
             "div[class*='ds-markdown']:last-of-type",
         ],
+        # Virtual-list aware selectors — only elements CURRENTLY RENDERED in the
+        # visible viewport. DeepSeek uses ds-virtual-list for long conversations:
+        # elements outside the viewport are removed from the DOM entirely.
+        # These selectors target only the visible slice, making text-change
+        # detection immune to count fluctuations caused by virtual recycling.
+        "virtual_list_response": [
+            ".ds-virtual-list-visible-items div.ds-markdown",
+            ".ds-virtual-list-visible-items div[class*='ds-markdown']",
+            # Fallback: no virtual list (short conversations / fresh session)
+            "div.ds-markdown",
+            "div[class*='ds-markdown']",
+        ],
         # "Typing"/generation in-progress indicator. TODO: verify.
         "loading_indicator": [
             "div[class*='loading']",

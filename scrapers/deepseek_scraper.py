@@ -762,6 +762,8 @@ class DeepSeekScraper(BaseAIChatScraper):
             if self.page is None:
                 await self.launch_browser(self.account)
 
+            # TEXT-CHANGE detection: capture last visible text before sending.
+            pre_send_text = await self._capture_pre_send_text()
             initial_response_count = await self._count_response_elements()
             await self.send_prompt(wrapped_prompt, mode="continue")
 
@@ -774,6 +776,7 @@ class DeepSeekScraper(BaseAIChatScraper):
                 stability_polls=t["stability_polls"],
                 poll_interval=t["poll_interval"],
                 initial_response_count=initial_response_count,
+                pre_send_text=pre_send_text,
             )
 
             ok, cleaned = self._validate_response(text)

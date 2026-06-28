@@ -5,7 +5,52 @@ Format: `[version] YYYY-MM-DD — summary`
 
 ---
 
-## [2.2.1] 2026-06-28 — Critical bug fixes: mode=new timeout, CONTINUE reliability, Skip goto() after restart
+## [2.2.2] 2026-06-28 — Critical bug fix: virtual-scroll breaks count-based detection (CONTINUE #3+)
+
+Rilis ini memperbaiki **Bug #9** — bug KRITIS yang tersisa dari sesi sebelumnya:
+CONTINUE ke-3 dan seterusnya selalu timeout (response_chars=0) karena DeepSeek
+menggunakan virtual scrolling yang menyebabkan element count tidak pernah berubah.
+Sekaligus memperbaiki `_wait_for_spa_ready` yang selalu timeout 10s pada Skip goto().
+
+### Bug Fixes
+
+#### `scrapers/base_scraper.py` — Virtual scrolling breaks count-based detection (CRITICAL)
+- **Root cause:** DeepSeek menggunakan `ds-virtual-list`. Elemen di luar viewport
+  **dihapus dari DOM**. Setelah beberapa exchange, saat response baru muncul di
+  bawah, satu elemen lama dihapus dari atas → total count **tetap sama** →
+  `count > baseline` selalu False → timeout 300 s.
+- **Fix:** Ganti count-based detection dengan **text-change detection**:
+  1. `_get_last_response_text()` — baca teks elemen terakhir dari
+     `.ds-virtual-list-visible-items div.ds-markdown` (virtual-scroll aware).
+  2. `_capture_pre_send_text()` — snapshot teks sebelum `send_prompt()`.
+  3. `wait_for_response()` dirombak: bandingkan teks saat ini dengan
+     `pre_send_text`. Deteksi response baru saat teks BERUBAH, bukan saat
+     count bertambah. Stability check tetap ada (teks harus stabil N polls).
+  4. `_count_response_elements()` dipertahankan untuk diagnostic/backward-compat.
+  5. `_virtual_list_selectors()` hook baru — subclass bisa override.
+- **Immune terhadap:** virtual-scroll recycling, `:last-of-type` mismatch,
+  DOM restructuring, fresh page (pre_send_text="" → response apapun terdeteksi).
+- **Semua call site** di `scrape()` dan `scrape_with_tool_result()` diupdate
+  untuk capture `pre_send_text` dan pass ke `wait_for_response()`.
+
+#### `config.py` — Tambah selector `virtual_list_response`
+- Tambah key `virtual_list_response` di `selectors` dengan selector scoped ke
+  `.ds-virtual-list-visible-items div.ds-markdown` (primary) dan fallback
+  unscoped untuk percakapan pendek di mana virtual list belum aktif.
+
+#### `browser_pool.py` — `_wait_for_spa_ready` selalu timeout 10s
+- **Root cause:** Chat input selector tidak pernah attach setelah virtual list
+  aktif → `_wait_for_spa_ready` SELALU timeout ~10s pada setiap Skip goto() call.
+- **Fix (Opsi A):** Jika chat input tidak ditemukan dalam `timeout_ms` DAN
+  `conversation_url` tersedia → force `page.goto(conversation_url)` untuk
+  reset DOM ke known-good state, lalu coba lagi. Eliminasi 10 s waste dan
+  memastikan DOM fully rendered sebelum `_capture_pre_send_text()`.
+- Semua 4 call site `_wait_for_spa_ready()` di `run_task()` dan
+  `run_task_with_tool_result()` diupdate untuk pass `conversation_url`.
+
+---
+
+
 
 Rilis ini memperbaiki **8 bug** yang ditemukan setelah optimasi v2.2.0: satu bug
 kritis pada scraper (mode=new timeout 300s karena response baseline salah), satu

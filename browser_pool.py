@@ -352,40 +352,73 @@ class BrowserPool:
         self,
         scraper: "DeepSeekScraper",
         timeout_ms: int = 10_000,
+        conversation_url: Optional[str] = None,
     ) -> None:
         """
         Wait for the DeepSeek React SPA to finish hydrating after a page.goto().
 
-        FIX (Bug #3): After domcontentloaded the SPA still needs to hydrate
-        and render existing message history. If _count_response_elements() is
-        called before hydration completes it returns 0 (or a lower number than
-        the actual message count), causing skip_count to be wrong and
-        wait_for_response to either immediately return a stale old response or
-        loop forever.
+        FIX (Bug #7): After domcontentloaded the SPA still needs to hydrate
+        and render existing message history before _count_response_elements() /
+        _capture_pre_send_text() is called.
 
-        Strategy (ordered cheapest → most reliable):
-          1. Wait for the chat input to be attached — confirms the SPA shell has
-             rendered enough to accept a new prompt. This is a fast, low-cost
-             check that reliably gates on SPA readiness.
-          2. If the chat input is not found within timeout_ms, log a warning and
-             continue anyway — better to proceed with a possibly stale count than
-             to hang indefinitely.
+        FIX (Bug #9 / SPA-ready always-timeout): _wait_for_spa_ready was
+        wasting ~10 s on every Skip goto() call because the chat-input selector
+        apparently doesn't attach reliably once the virtual list is active.
+        New strategy: if the chat input is NOT found within timeout_ms AND a
+        conversation_url is available, force a hard page.goto() to reset the
+        DOM to a clean state, then wait once more. This eliminates the 10 s
+        penalty AND guarantees the virtual list is fully rendered before the
+        prompt is sent.
+
+        Strategy:
+          1. Wait for chat input attached (cheap, fast).
+          2. On timeout + conversation_url → force page.goto(), wait again.
+          3. On timeout + no URL → log warning, proceed best-effort.
         """
         if scraper.page is None:
             return
         from config import DEEPSEEK_CONFIG
         chat_selectors = DEEPSEEK_CONFIG["selectors"].get("chat_input", [])
-        for sel in chat_selectors:
+
+        async def _try_find(t_ms: int) -> bool:
+            for sel in chat_selectors:
+                try:
+                    await scraper.page.locator(sel).first.wait_for(
+                        state="attached", timeout=t_ms
+                    )
+                    log.debug("_wait_for_spa_ready: chat input attached (%s)", sel)
+                    return True
+                except Exception:
+                    continue
+            return False
+
+        # First attempt.
+        if await _try_find(timeout_ms):
+            return
+
+        # Timeout — try forced goto if we know the URL.
+        if conversation_url:
+            log.warning(
+                "_wait_for_spa_ready: chat input not found within %dms — "
+                "forcing page.goto(%s) to reset DOM",
+                timeout_ms, conversation_url,
+            )
             try:
-                await scraper.page.locator(sel).first.wait_for(
-                    state="attached", timeout=timeout_ms
+                await scraper.page.goto(
+                    conversation_url,
+                    wait_until="domcontentloaded",
+                    timeout=30_000,
                 )
-                log.debug("_wait_for_spa_ready: chat input attached (%s)", sel)
-                return
-            except Exception:
-                continue
+                if await _try_find(timeout_ms):
+                    log.info(
+                        "_wait_for_spa_ready: chat input found after forced goto()"
+                    )
+                    return
+            except Exception as exc:
+                log.warning("_wait_for_spa_ready forced goto() failed: %s", exc)
+
         log.warning(
-            "_wait_for_spa_ready: chat input not found within %dms — "
+            "_wait_for_spa_ready: chat input not found after %dms — "
             "proceeding with possibly incomplete DOM",
             timeout_ms,
         )
@@ -455,7 +488,13 @@ class BrowserPool:
                     # hydrated. After a fresh restart the persistent
                     # profile may have the right URL but the DOM hasn't
                     # finished rendering the message history yet.
-                    await self._wait_for_spa_ready(slot.scraper, timeout_ms=10_000)
+                    # Pass conversation_url so that if the chat input is not
+                    # found (SPA-ready timeout), a forced goto() can recover.
+                    await self._wait_for_spa_ready(
+                        slot.scraper,
+                        timeout_ms=10_000,
+                        conversation_url=conversation_url,
+                    )
                 else:
                     log.info(
                         "CONTINUE: navigating slot %d to %s", slot.index, conversation_url
@@ -470,9 +509,12 @@ class BrowserPool:
                         # deterministic SPA-ready check. Wait for the chat
                         # input to be attached, confirming the React app has
                         # hydrated and rendered existing message history.
-                        # This ensures _count_response_elements() (called
-                        # inside scrape()) sees the correct baseline count.
-                        await self._wait_for_spa_ready(slot.scraper, timeout_ms=10_000)
+                        # conversation_url passed for forced-goto fallback.
+                        await self._wait_for_spa_ready(
+                            slot.scraper,
+                            timeout_ms=10_000,
+                            conversation_url=conversation_url,
+                        )
                         slot.scraper._conversation_started = True
                     except Exception as nav_exc:
                         log.warning(
@@ -557,7 +599,11 @@ class BrowserPool:
                     )
                     slot.scraper._conversation_started = True
                     # FIX: SPA ready check even when skipping goto.
-                    await self._wait_for_spa_ready(slot.scraper, timeout_ms=10_000)
+                    await self._wait_for_spa_ready(
+                        slot.scraper,
+                        timeout_ms=10_000,
+                        conversation_url=conversation_url,
+                    )
                 else:
                     log.info(
                         "Tool Turn 2: navigating slot %d to %s",
@@ -570,7 +616,11 @@ class BrowserPool:
                             timeout=30_000,
                         )
                         # FIX (Bug #3): deterministic SPA-ready wait instead of sleep(2).
-                        await self._wait_for_spa_ready(slot.scraper, timeout_ms=10_000)
+                        await self._wait_for_spa_ready(
+                            slot.scraper,
+                            timeout_ms=10_000,
+                            conversation_url=conversation_url,
+                        )
                         slot.scraper._conversation_started = True
                     except Exception as nav_exc:
                         log.warning("Tool Turn 2 nav failed: %s", nav_exc)
