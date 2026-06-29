@@ -634,10 +634,29 @@ tool result.
 > envelope (`{"status":"success","choices":[...]}` or `{"status":"tool_calls",
 > ...}`). The scraper parses that envelope and forwards OpenAI-compatible fields
 > to you — so **the HTTP API you call is unchanged**; you always send and receive
-> standard OpenAI-style payloads. If DeepSeek replies with non-JSON text, the
-> worker sends a corrective-feedback prompt in the same conversation before
-> retrying. This mode mirrors PAF-ModelQwen and can be disabled server-side via
-> `JSON_API_CONFIG["enabled"] = False`.
+> standard OpenAI-style payloads.
+>
+> **Turn 1 (scrape):** If DeepSeek replies with invalid JSON, the worker sends a
+> corrective-feedback prompt in the same conversation (up to
+> `max_corrective_retries` times) before retrying. This mirrors PAF-ModelQwen.
+>
+> **Turn 2 (scrape_with_tool_result):** Tool results are injected as:
+> ```
+> [TOOL RESULT]
+> {"tool_call_id":"call_001","name":"write_file","result":{"success":true}}
+>
+> [USER REQUEST]
+> {"continue":true,"model":"account1"}
+> ```
+> No corrective loop runs in Turn 2 — if the response is invalid JSON, the
+> error is returned immediately (same as PAF-ModelQwen). The client should
+> handle the error and decide whether to retry.
+>
+> **JSON repair:** Both `_repair_unescaped_quotes` (content-block-based escaping)
+> and `_repair_tool_calls_arguments` (state-machine argument escaping) are
+> applied before giving up, matching PAF-ModelQwen's repair strategy exactly.
+>
+> This mode can be disabled server-side via `JSON_API_CONFIG["enabled"] = False`.
 
 ---
 
@@ -925,6 +944,6 @@ For issues or questions:
 
 ---
 
-**Version**: 2.4.0  
-**Last Updated**: June 29, 2026  
+**Version**: 2.5.0  
+**Last Updated**: June 30, 2026  
 **Base URL**: http://16.79.2.204:9000

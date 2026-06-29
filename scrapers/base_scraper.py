@@ -653,28 +653,113 @@ class BaseAIChatScraper(ABC):
             return None
 
     @staticmethod
-    def _repair_unescaped_quotes(raw: str) -> str:
-        """Repair JSON where string values contain raw (unescaped) quotes."""
-        if not raw:
-            return raw
-        try:
-            json.loads(raw)
-            return raw
-        except Exception:
-            pass
-        return re.sub(r'(?<=[\w\s])"(?=[\w\s])', r'\\"', raw)
+    def _repair_unescaped_quotes(raw: str) -> "str | None":
+        """
+        Fallback repair untuk kasus paling umum: model menulis quote literal (")
+        di dalam isi `content` tanpa di-escape, sehingga merusak parsing JSON.
+
+        Strategi: cari blok `"content":"..."` dengan regex non-greedy yang
+        berhenti tepat sebelum penanda akhir field yang valid (`","finish_reason"`
+        atau `"}` penutup objek message), lalu escape ulang SEMUA quote dan
+        backslash di dalam isi tsb sebelum di-reinsert ke string asli.
+
+        Returns string JSON yang sudah diperbaiki, atau None jika pola
+        `"content":"..."` tidak ditemukan sama sekali (repair tidak applicable).
+        """
+        marker = '"content":"'
+        start_idx = raw.find(marker)
+        if start_idx == -1:
+            return None
+        content_start = start_idx + len(marker)
+
+        end_markers = ['","finish_reason"', '"},"finish_reason"', '"}}']
+        end_idx = -1
+        for em in end_markers:
+            idx = raw.rfind(em)
+            if idx > content_start and (end_idx == -1 or idx > end_idx):
+                end_idx = idx
+
+        if end_idx == -1:
+            return None
+
+        inner = raw[content_start:end_idx]
+        repaired_inner = (
+            inner.replace("\\", "\\\\")
+                 .replace('"', '\\"')
+                 .replace("\n", "\\n")
+                 .replace("\r", "\\r")
+                 .replace("\t", "\\t")
+        )
+
+        repaired = (
+            raw[:content_start] + repaired_inner + raw[end_idx:]
+        )
+        return repaired
 
     @staticmethod
-    def _repair_tool_calls_arguments(raw: str) -> str:
-        """Repair the `arguments` field of OpenAI-style tool calls."""
-        if not raw or '"arguments"' not in raw:
-            return raw
-        return re.sub(
-            r'"arguments"\s*:\s*"?(\{.*?\})"?(?=\s*[},])',
-            lambda m: '"arguments": ' + json.dumps(m.group(1)),
-            raw,
-            flags=re.DOTALL,
-        )
+    def _repair_tool_calls_arguments(raw: str) -> "str | None":
+        """
+        Repair kasus tool_calls di mana arguments berisi inner quotes yang tidak
+        di-escape, sehingga menyebabkan JSON truncated/malformed.
+
+        Strategi: untuk setiap string value di dalam arguments, escape semua
+        inner quotes dan karakter kontrol yang tidak ter-escape.
+        """
+        import re as _re
+        args_marker = '"arguments":{'
+        start = raw.find(args_marker)
+        if start == -1:
+            return None
+        args_start = start + len(args_marker) - 1  # posisi `{`
+
+        def escape_string_values(s: str) -> str:
+            """Escape unescaped quotes dan newline di dalam string JSON values."""
+            result = []
+            i = 0
+            while i < len(s):
+                if s[i] == '"':
+                    result.append('"')
+                    i += 1
+                    while i < len(s):
+                        if s[i] == '\\' and i + 1 < len(s):
+                            result.append(s[i])
+                            result.append(s[i + 1])
+                            i += 2
+                        elif s[i] == '"':
+                            rest = s[i + 1:].lstrip()
+                            if rest and rest[0] in (':', ',', '}', ']'):
+                                result.append('"')
+                                i += 1
+                                break
+                            else:
+                                result.append('\\\"')
+                                i += 1
+                        elif s[i] in ('\n', '\r', '\t'):
+                            result.append('\\n' if s[i] == '\n' else ('\\r' if s[i] == '\r' else '\\t'))
+                            i += 1
+                        else:
+                            result.append(s[i])
+                            i += 1
+                else:
+                    result.append(s[i])
+                    i += 1
+            return ''.join(result)
+
+        try:
+            json.loads(raw)
+            return None  # tidak perlu repair
+        except Exception:
+            pass
+
+        tail = raw[args_start:]
+        repaired_tail = escape_string_values(tail)
+        repaired = raw[:args_start] + repaired_tail
+
+        try:
+            json.loads(repaired)
+            return repaired
+        except Exception:
+            return None
 
     @abstractmethod
     def _validate_response(self, raw: str) -> tuple[bool, str]:

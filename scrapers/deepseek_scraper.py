@@ -738,174 +738,146 @@ class DeepSeekScraper(BaseAIChatScraper):
     # ------------------------------------------------------------------ #
     # Turn 2: tool-result injection (mirrors PAF-ModelQwen)
     # ------------------------------------------------------------------ #
+    def _build_tool_result_prompt(
+        self,
+        tool_messages: list[dict],
+        next_user_msg: Optional[str] = None,
+    ) -> str:
+        """
+        Build prompt for Turn 2 (inject tool result into existing DeepSeek conversation).
+
+        Format sent to DeepSeek (CONTINUE mode):
+            [TOOL RESULT]
+            {"tool_call_id":"call_001","name":"write_file","result":{"success":true}}
+
+            [USER REQUEST]
+            {"continue":true,"model":"account1"}
+
+        If next_user_msg is provided (user sends a new message after tool result):
+            [USER REQUEST]
+            {"prompt":"now run it","model":"account1"}
+        """
+        account_name = self.account or "deepseek"
+        parts = ["[TOOL RESULT]"]
+
+        for tm in tool_messages:
+            entry = {
+                "tool_call_id": tm.get("tool_call_id"),
+                "name":         tm.get("name"),
+                "result":       tm.get("content"),
+            }
+            parts.append(json.dumps(entry, ensure_ascii=False))
+
+        user_request: dict = {"model": account_name}
+        if next_user_msg:
+            user_request["prompt"] = next_user_msg
+        else:
+            user_request["continue"] = True   # signal: no new user message
+        if self._max_tokens is not None:
+            user_request["max_tokens"] = self._max_tokens
+
+        parts += ["", "[USER REQUEST]", json.dumps(user_request, ensure_ascii=False)]
+        return "\n".join(parts)
+
     async def scrape_with_tool_result(
         self,
         tool_messages: list[dict],
         next_user_msg: Optional[str] = None,
     ) -> dict:
         """
-        Inject tool results back into an existing CONTINUE conversation (Turn 2).
+        Send tool result to DeepSeek in CONTINUE session (Turn 2).
+        Called by public.py after the client executes a tool locally.
 
-        Builds a structured prompt:
+        Args:
+            tool_messages: list of {role:tool, tool_call_id, name, content} dicts
+            next_user_msg: optional next user message after tool result
 
-            [TOOL RESULT]
-            {"tool_call_id": "...", "name": "...", "result": {...}}
-            ... (one block per tool message)
-
-            [USER REQUEST]              <- only if next_user_msg is provided
-            {"prompt": "..."}
-
-        Then calls send_prompt() in CONTINUE mode (no new-chat navigation) and
-        waits for the model response exactly like a normal scrape() call.
-
-        Returns a dict in the same shape as scrape():
-          {"ok": True, "mode": "continue", "account": ..., "text": ..., ...}
+        Returns:
+            dict with finish_reason and possibly tool_calls (if DeepSeek requests
+            another tool) or response (stop). No corrective loop — if the
+            response is invalid JSON, returns error immediately (same as Qwen).
         """
-        import json as _json
+        from config import DEEPSEEK_CONFIG
         from datetime import datetime
 
-        parts: list[str] = []
+        prompt = self._build_tool_result_prompt(tool_messages, next_user_msg)
 
-        for tm in tool_messages:
-            # Normalise: accept both {"result": ...} and {"content": ...}
-            result_val = tm.get("result") or tm.get("content") or ""
-            if isinstance(result_val, (dict, list)):
-                result_str = _json.dumps(result_val, ensure_ascii=False)
-            else:
-                result_str = str(result_val)
+        # ── Send + wait for response (same pattern as scrape()) ──────────── #
+        # send_prompt() returns a selector string, NOT the response text.
+        # We must call wait_for_response() separately to get the actual text.
+        # For CONTINUE mode: capture pre_send_text BEFORE sending so the
+        # text-change detection knows when the new response arrives.
+        # ──────────────────────────────────────────────────────────────────── #
+        if self.page is None:
+            await self.launch_browser(self.account)
 
-            block = {
-                "tool_call_id": tm.get("tool_call_id", ""),
-                "name":         tm.get("name", tm.get("tool_name", "")),
-                "result":       result_str,
-            }
-            parts.append("[TOOL RESULT]\n" + _json.dumps(block, ensure_ascii=False))
+        pre_send_text = await self._capture_pre_send_text()
+        initial_response_count = await self._count_response_elements()
 
-        if next_user_msg:
-            parts.append(
-                "[USER REQUEST]\n"
-                + _json.dumps({"prompt": next_user_msg}, ensure_ascii=False)
-            )
-
-        # In JSON API mode, remind the model to keep replying with the JSON
-        # envelope (it may emit either a final `success` answer or another
-        # `tool_calls` request after seeing the tool result).
-        from config import JSON_API_CONFIG
-        _json_mode = JSON_API_CONFIG.get("enabled", False)
-        if _json_mode:
-            parts.insert(
-                0,
-                "[SYSTEM CONTEXT]\n"
-                "Continue acting as a JSON API endpoint. After reading the tool "
-                "result(s) below, reply with ONE single line of JSON only "
-                "(no markdown, no extra text) using EXACTLY one of:\n"
-                '{"status":"success","choices":[{"index":0,"message":{"role":'
-                '"assistant","content":"<final answer>"},"finish_reason":"stop"}]}\n'
-                "or, if you need another function call:\n"
-                '{"status":"tool_calls","tool_calls":[{"id":"call_<id>","type":'
-                '"function","function":{"name":"<name>","arguments":{<args>}}}]}',
-            )
-
-        wrapped_prompt = "\n\n".join(parts)
-
-        log.info(
-            "scrape_with_tool_result: %d tool result(s), next_user=%s",
-            len(tool_messages),
-            repr(next_user_msg[:40]) if next_user_msg else "None",
+        # wrap_as_user_request=False: prompt is already a fully structured
+        # [TOOL RESULT]/[USER REQUEST] envelope — do NOT re-wrap it.
+        # mode="continue" required: tool result must go to the same session.
+        await self.send_prompt(
+            prompt, mode="continue", wrap_as_user_request=False
         )
 
-        # Reuse the same orchestration logic as scrape() but skip the full
-        # retry loop — send directly and return.
-        try:
-            if self.page is None:
-                await self.launch_browser(self.account)
+        t = DEEPSEEK_CONFIG["timeouts"]
+        text = await self.wait_for_response(
+            response_selectors=self._response_selectors(),
+            timeout=t["response_wait"],
+            stability_secs=t["stability_check"],
+            stability_polls=t["stability_polls"],
+            poll_interval=t["poll_interval"],
+            initial_response_count=initial_response_count,
+            pre_send_text=pre_send_text,
+        )
 
-            # TEXT-CHANGE detection: capture last visible text before sending.
-            pre_send_text = await self._capture_pre_send_text()
-            initial_response_count = await self._count_response_elements()
-            # wrap_as_user_request=False: this prompt is already a fully
-            # structured [SYSTEM CONTEXT]/[TOOL RESULT]/[USER REQUEST] envelope;
-            # do NOT let send_prompt re-wrap it.
-            await self.send_prompt(wrapped_prompt, mode="continue", wrap_as_user_request=False)
-
-            from config import DEEPSEEK_CONFIG as _DS_CFG
-            t = _DS_CFG["timeouts"]
-            text = await self.wait_for_response(
-                response_selectors=self._response_selectors(),
-                timeout=t["response_wait"],
-                stability_secs=t["stability_check"],
-                stability_polls=t["stability_polls"],
-                poll_interval=t["poll_interval"],
-                initial_response_count=initial_response_count,
-                pre_send_text=pre_send_text,
-            )
-
-            finish_reason = "stop"
-            tool_calls_list = None
-
-            if _json_mode:
-                is_valid, parsed, verr = self._validate_deepseek_json_response(text)
-                if not is_valid:
-                    log.warning(
-                        "tool-result JSON invalid: %s | raw[:200]=%s",
-                        verr, (text or "")[:200],
-                    )
-                    return {
-                        "ok":        False,
-                        "success":   False,
-                        "mode":      "continue",
-                        "account":   self.account,
-                        "error":     f"invalid_json_response: {verr}",
-                        "timestamp": datetime.now().astimezone().isoformat(),
-                    }
-                if parsed.get("status") == "error":
-                    err_obj = parsed.get("error", {}) or {}
-                    return {
-                        "ok":        False,
-                        "success":   False,
-                        "mode":      "continue",
-                        "account":   self.account,
-                        "error":     err_obj.get("message") or "model error envelope",
-                        "timestamp": datetime.now().astimezone().isoformat(),
-                    }
-                if parsed.get("status") == "tool_calls":
-                    tool_calls_list = parsed.get("tool_calls", [])
-                    finish_reason = "tool_calls"
-                    cleaned = ""
-                else:
-                    cleaned = parsed["choices"][0]["message"]["content"]
-                    finish_reason = parsed["choices"][0].get("finish_reason", "stop")
-            else:
-                ok, cleaned = self._validate_response(text)
-                if not ok:
-                    cleaned = self._repair_unescaped_quotes(cleaned)
-                    cleaned = self._repair_tool_calls_arguments(cleaned)
-
-            result = {
-                "ok":          True,
-                "success":     True,
-                "finish_reason": finish_reason,
-                "mode":        "continue",
-                "account":     self.account,
-                "text":        cleaned,
-                "response":    cleaned,
-                "code_blocks": self.extract_code_blocks(cleaned),
-                "timestamp":   datetime.now().astimezone().isoformat(),
-            }
-            if tool_calls_list is not None:
-                result["tool_calls"] = tool_calls_list
-            return result
-        except Exception as exc:
-            log.error("scrape_with_tool_result error: %s", exc, exc_info=True)
-            await self.take_debug_screenshot("tool_result_error")
-            return {
-                "ok":        False,
-                "mode":      "continue",
-                "account":   self.account,
-                "error":     str(exc),
-                "timestamp": datetime.now().astimezone().isoformat(),
-            }
-
+        # Validate response — no corrective loop (Qwen pattern).
+        is_valid, parsed, err = self._validate_deepseek_json_response(text)
+        if is_valid and parsed:
+            status = parsed.get("status")
+            if status == "tool_calls":
+                return {
+                    "ok":            True,
+                    "success":       True,
+                    "finish_reason": "tool_calls",
+                    "mode":          "continue",
+                    "account":       self.account,
+                    "tool_calls":    parsed.get("tool_calls", []),
+                }
+            if status == "success":
+                content = parsed.get("choices", [{}])[0].get("message", {}).get("content", "")
+                return {
+                    "ok":            True,
+                    "success":       True,
+                    "finish_reason": "stop",
+                    "mode":          "continue",
+                    "account":       self.account,
+                    "text":          content,
+                    "response":      content,
+                }
+            if status == "error":
+                err_obj = parsed.get("error", {}) or {}
+                return {
+                    "ok":      False,
+                    "success": False,
+                    "mode":    "continue",
+                    "account": self.account,
+                    "error":   err_obj.get("message") or "model error envelope",
+                }
+        # Invalid JSON — return error immediately, no retry (Qwen pattern)
+        log.warning(
+            "tool-result JSON invalid: %s | raw[:200]=%s",
+            err, (response_text or "")[:200],
+        )
+        return {
+            "ok":      False,
+            "success": False,
+            "mode":    "continue",
+            "account": self.account,
+            "error":   f"Invalid response after tool result: {err}",
+            "raw":     response_text,
+        }
     # ------------------------------------------------------------------ #
     # Attachments — CDP clipboard inject + Ctrl+V (NOT <input type=file>)
     # ------------------------------------------------------------------ #
@@ -1232,9 +1204,9 @@ class DeepSeekScraper(BaseAIChatScraper):
             repaired = None
             if '"tool_calls"' in candidate or '"arguments"' in candidate:
                 repaired = self._repair_tool_calls_arguments(candidate)
-            if repaired is None or repaired == candidate:
+            if repaired is None:
                 repaired = self._repair_unescaped_quotes(candidate)
-            if repaired and repaired != candidate:
+            if repaired is not None and repaired != candidate:
                 data, err2 = _try_parse(repaired)
                 if data is None:
                     return False, None, f"JSON parse error: {err} | repair failed: {err2}"

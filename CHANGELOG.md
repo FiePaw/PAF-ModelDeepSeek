@@ -5,6 +5,64 @@ Format: `[version] YYYY-MM-DD — summary`
 
 ---
 
+## [2.5.0] 2026-06-30 — Qwen-aligned tool calling + repair parity + VPS tool forwarding
+
+Rilis ini membawa tool calling PAF-ModelDeepSeek ke **paritas penuh** dengan
+PAF-ModelQwen, sekaligus memperbaiki bug kritis di VPS yang menyebabkan
+**infinite tool-call loop**.
+
+### Bug Fixes
+
+#### `PublicForward/ForVPS/vps_server.py` — Tool result forwarding (CRITICAL)
+- **Root cause:** VPS hanya meneruskan `prompt = last_user_message()` ke worker.
+  Saat CLI mengirim tool results (`role:"tool"`), VPS tetap mengirim prompt
+  user asli — worker masuk ke `scrape()` (bukan `scrape_with_tool_result()`)
+  → prompt dibungkus ulang `[SYSTEM CONTEXT]/[USER REQUEST]` → DeepSeek melihat
+  permintaan yang sama → minta tool lagi → **infinite loop**.
+- **Fix:** VPS sekarang mengekstrak `tool_messages` dari `messages` array dan
+  meneruskan `tool_messages` + full `messages` array ke worker via dispatch.
+  Worker mendeteksi `tool_msgs is not None` → route ke
+  `scrape_with_tool_result()`.
+- **ChatMessage model** ditambah field `tool_calls` dan `tool_call_id`
+  (parity dengan Qwen) agar Pydantic tidak menolak message role:tool/assistant.
+
+#### `scrapers/deepseek_scraper.py` — scrape_with_tool_result() missing wait_for_response
+- **Root cause:** `send_prompt()` mengembalikan CSS selector string, bukan
+  response text. `scrape_with_tool_result()` langsung memvalidasi selector
+  string sebagai JSON → `Expecting value: line 1 column 1 (char 0)`.
+- **Fix:** Tambah `_capture_pre_send_text()` + `wait_for_response()` setelah
+  `send_prompt()`, sama dengan pattern di `scrape()`.
+
+### Improvements (Qwen parity)
+
+#### `scrapers/base_scraper.py` — Repair methods upgraded to Qwen versions
+- **`_repair_unescaped_quotes`**: Ganti regex sederhana dengan content-block-based
+  escaping — cari blok `"content":"..."`, tentukan batas akhir field, escape ulang
+  semua quote/backslash/newline di dalamnya. Return `None` jika tidak applicable.
+- **`_repair_tool_calls_arguments`**: Ganti regex dengan state-machine parser —
+  parse karakter-per-karakter di dalam blok arguments, deteksi inner quote vs
+  closing quote berdasarkan karakter berikutnya (`:`, `,`, `}`, `]`).
+
+#### `scrapers/deepseek_scraper.py` — Tool result format (Qwen pattern)
+- **`_build_tool_result_prompt()`** (NEW): Format `[TOOL RESULT]` + `[USER REQUEST]`
+  dengan `{"continue":true,"model":"..."}`. Tanpa `[SYSTEM CONTEXT]` reminder.
+- **`scrape_with_tool_result()`** (rewritten): `_capture_pre_send_text()` →
+  `send_prompt()` → `wait_for_response()` → `_validate_deepseek_json_response()`.
+  No corrective loop (Qwen pattern).
+- **`_validate_deepseek_json_response()`**: Handle `None` return dari repair methods.
+
+### Files Modified
+
+| File | Changes |
+|------|---------|
+| `scrapers/base_scraper.py` | `_repair_unescaped_quotes` + `_repair_tool_calls_arguments` → Qwen versions |
+| `scrapers/deepseek_scraper.py` | `_build_tool_result_prompt` (new) + `scrape_with_tool_result` (rewritten) + `_validate` fix |
+| `PublicForward/ForVPS/vps_server.py` | `ChatMessage` model + tool_messages extraction + full messages forwarding |
+| `API_USAGE.md` | Updated tool calling docs + internal architecture |
+| `CHANGELOG.md` | This entry |
+
+---
+
 ## [2.2.2] 2026-06-28 — Critical bug fix: virtual-scroll breaks count-based detection (CONTINUE #3+)
 
 Rilis ini memperbaiki **Bug #9** — bug KRITIS yang tersisa dari sesi sebelumnya:
@@ -724,4 +782,4 @@ siblings have fewer. Robust to minified class name changes.
 
 ## [2.0.2] and earlier
 
-See git history (`git log --oneline`) for changes prior to v2.0.3.
+See git history (`git log --oneline`) for changes prior to v2.0.3

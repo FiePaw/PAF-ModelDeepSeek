@@ -73,8 +73,11 @@ MODEL_ALIASES = {
 # =========================================================================== #
 class ChatMessage(BaseModel):
     role: str
-    content: Any  # str, or list of content parts (for multimodal)
+    content: Any = None  # str, list of content parts, or None (for tool_calls)
     name: Optional[str] = None
+    # Tool calling support (parity with PAF-ModelQwen):
+    tool_calls: Optional[list] = None    # set when role=assistant & has tool_call
+    tool_call_id: Optional[str] = None   # set when role=tool (tool result)
 
 
 class ToolFunctionDef(BaseModel):
@@ -526,6 +529,31 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
             if m.role == "system" and isinstance(m.content, str) and m.content.strip()
         ) or None
 
+        # ── Tool result forwarding (parity with PAF-ModelQwen) ──────────── #
+        # The CLI sends tool results as {role:"tool", tool_call_id, name,
+        # content} entries inside the messages array. The VPS must extract
+        # these and forward them as `tool_messages` so the worker routes to
+        # scrape_with_tool_result() instead of scrape() (which would re-wrap
+        # the original prompt and cause an infinite tool-call loop).
+        #
+        # We also forward the full messages array (serialized) so the worker
+        # can detect the assistant tool_calls message and any next user message.
+        # ─────────────────────────────────────────────────────────────────── #
+        tool_messages = [
+            {
+                "role":         m.role,
+                "tool_call_id": m.tool_call_id,
+                "name":         m.name,
+                "content":      m.content if isinstance(m.content, str) else json.dumps(m.content, ensure_ascii=False),
+            }
+            for m in req.messages
+            if m.role == "tool"
+        ] or None
+
+        messages_payload = [
+            m.model_dump(exclude_none=True) for m in req.messages
+        ]
+
         # Dispatch to worker
         result = await worker_mgr.dispatch(
             prompt=req.last_user_message(),
@@ -539,6 +567,9 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
             tools=tools_payload,
             max_tokens=req.max_tokens,
             system_prompt=system_prompt,
+            # Tool result forwarding:
+            tool_messages=tool_messages,
+            messages=messages_payload,
         )
 
         if not result.get("ok"):
