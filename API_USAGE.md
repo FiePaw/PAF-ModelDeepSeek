@@ -114,8 +114,8 @@ curl -X POST http://16.79.2.204:9000/v1/chat/completions \
   "model": "deepseek-chat",          // Required: Always "deepseek-chat"
   "messages": [                       // Required: Array of message objects
     {
-      "role": "user",                 // Required: "user", "assistant", or "system"
-      "content": "Your message here"  // Required: Message content
+      "role": "user",                 // Required: "user", "assistant", "system", or "tool"
+      "content": "Your message here"  // Required: Message content (string or null for tool_calls)
     }
   ],
   
@@ -127,6 +127,21 @@ curl -X POST http://16.79.2.204:9000/v1/chat/completions \
   "model_tab": "expert",              // Direct tab selection: "instant", "expert", or "vision"
   "deep_think": true,                 // Enable/disable DeepThink toggle
   "search": false,                    // Enable/disable search toggle
+  "max_tokens": 2000,                 // Max response tokens (passed to model via [USER REQUEST])
+  "tools": [                          // OpenAI-compatible function definitions (see Example 9)
+    {
+      "type": "function",
+      "function": {
+        "name": "write_file",
+        "description": "Write content to a file",
+        "parameters": {
+          "type": "object",
+          "properties": {"path": {"type": "string"}},
+          "required": ["path"]
+        }
+      }
+    }
+  ],
   "attachments": [                    // File uploads (Base64)
     {
       "filename": "data.csv",
@@ -137,6 +152,15 @@ curl -X POST http://16.79.2.204:9000/v1/chat/completions \
   "stream": false                     // Must be false (streaming not supported)
 }
 ```
+
+> **System messages:** Include `{"role": "system", "content": "..."}` in the
+> `messages` array. The content is merged into the internal `[SYSTEM CONTEXT]`
+> sent to DeepSeek alongside the JSON API instructions.
+>
+> **Tool calling:** When `tools` is provided, DeepSeek may respond with
+> `finish_reason: "tool_calls"` instead of a normal answer. Send the tool
+> result back in a follow-up `continue` request with a `{"role": "tool", ...}`
+> message (see Example 9).
 
 #### think_mode Aliases
 
@@ -179,9 +203,12 @@ curl -X POST http://16.79.2.204:9000/v1/chat/completions \
 
 #### Response Format
 
+The API is **OpenAI Chat Completions–compatible** (same envelope shape as
+PAF-ModelQwen), so OpenAI SDKs and standard HTTP clients work unchanged.
+
 ```json
 {
-  "id": "req-abc123def456",
+  "id": "chatcmpl-abc123def456",
   "object": "chat.completion",
   "created": 1719374917,
   "model": "deepseek-chat",
@@ -196,22 +223,45 @@ curl -X POST http://16.79.2.204:9000/v1/chat/completions \
     }
   ],
   "usage": {
-    "prompt_tokens": 0,
-    "completion_tokens": 0,
-    "total_tokens": 0
+    "prompt_tokens": 12,
+    "completion_tokens": 148,
+    "total_tokens": 160
   },
   "x_meta": {
     "session_id": "my-session",
-    "account_name": "account1",
+    "mode": "new",
+    "mode_fallback": false,
+    "account": "account1",
     "conversation_url": "https://chat.deepseek.com/chat/abc123",
     "model_tab": "expert",
     "deep_think": true,
-    "search": false,
-    "worker_id": "worker-DESKTOP-ABC123-001",
-    "processing_time_ms": 3245
+    "web_search": false,
+    "response_time": 3.24,
+    "timestamp": 1719374917.45,
+
+    "model": "account1",
+    "account_index": 0,
+    "account_status": "ok",
+    "account_file": "profiles/account1",
+    "retry_count": 0,
+    "response_time_ms": 3245,
+    "think_mode": null
   }
 }
 ```
+
+> **Token usage is now accurate.** `usage` is computed by the worker using
+> `tiktoken` (`cl100k_base` encoding) — the same accurate counting approach as
+> PAF-ModelQwen — and only falls back to a `len/4` estimate if `tiktoken` is
+> unavailable on the worker. Earlier builds returned `0` for all token fields.
+>
+> **`x_meta` is enriched.** In addition to the VPS-level fields (`session_id`,
+> `mode`, `account`, `conversation_url`, timing), the worker's `x_metadata`
+> block is folded in (`account_index`, `account_status`, `account_file`,
+> `retry_count`, `response_time_ms`, `model_tab`, `deep_think`, `web_search`,
+> `think_mode`). `think_mode` is always `null` for DeepSeek because it uses the
+> Layer 1 mode pill (Instant/Expert/Vision) + Layer 2 toggles (DeepThink/Search)
+> instead of Qwen's `think_mode` dropdown.
 
 #### Response Headers
 
@@ -257,7 +307,7 @@ curl -X POST http://16.79.2.204:9000/v1/chat/completions \
   }],
   "x_meta": {
     "session_id": null,
-    "account_name": "account1",
+    "account": "account1",
     "conversation_url": "https://chat.deepseek.com/chat/xyz",
     "model_tab": "instant",
     "deep_think": false
@@ -284,7 +334,7 @@ curl -X POST http://16.79.2.204:9000/v1/chat/completions \
 **Behavior:**
 - Attempts to route to `account2`
 - Falls back to any available account if `account2` is busy
-- Response includes actual account used in `x_meta.account_name`
+- Response includes actual account used in `x_meta.account`
 
 ---
 
@@ -485,6 +535,112 @@ print(response.choices[0].message.content)
 
 ---
 
+### Example 8: System Prompt
+
+`system` role messages are honored — they are merged into the internal
+`[SYSTEM CONTEXT]` sent to DeepSeek.
+
+```bash
+curl -X POST http://16.79.2.204:9000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-chat",
+    "messages": [
+      {"role": "system", "content": "You are a terse assistant. Answer in one sentence."},
+      {"role": "user", "content": "Explain black holes."}
+    ]
+  }'
+```
+
+---
+
+### Example 9: Tool Calling (OpenAI-compatible Function Calling)
+
+Provide a `tools` array. If DeepSeek decides it needs a function, the response
+comes back with `finish_reason: "tool_calls"` and a `tool_calls` array. Execute
+the function locally, then send the result back in a follow-up `continue`
+request (using the `session_id` from Turn 1, with a `tool` role message).
+
+**Turn 1 — request with tools:**
+```bash
+curl -X POST http://16.79.2.204:9000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-chat",
+    "session_id": "tool-demo",
+    "mode": "new",
+    "messages": [{"role": "user", "content": "Create a file test.py"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "write_file",
+        "description": "Write content to a file",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {"type": "string"},
+            "content": {"type": "string"}
+          },
+          "required": ["path"]
+        }
+      }
+    }]
+  }'
+```
+
+**Turn 1 response (tool call requested):**
+```json
+{
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [{
+        "id": "call_a1b2",
+        "type": "function",
+        "function": {"name": "write_file", "arguments": {"path": "test.py", "content": "print('hi')"}}
+      }]
+    },
+    "finish_reason": "tool_calls"
+  }]
+}
+```
+
+**Turn 2 — send the tool result back:**
+```bash
+curl -X POST http://16.79.2.204:9000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-chat",
+    "session_id": "tool-demo",
+    "mode": "continue",
+    "messages": [
+      {"role": "assistant", "content": null, "tool_calls": [{"id": "call_a1b2", "type": "function", "function": {"name": "write_file", "arguments": {"path": "test.py"}}}]},
+      {"role": "tool", "tool_call_id": "call_a1b2", "name": "write_file", "content": "{\"success\": true}"}
+    ]
+  }'
+```
+
+DeepSeek then returns a normal `finish_reason: "stop"` answer incorporating the
+tool result.
+
+---
+
+> ### 🧩 How it works internally (JSON API mode)
+>
+> Under the hood, every prompt is wrapped in a `[SYSTEM CONTEXT]` / `[USER
+> REQUEST]` envelope instructing DeepSeek to reply with a single-line JSON
+> envelope (`{"status":"success","choices":[...]}` or `{"status":"tool_calls",
+> ...}`). The scraper parses that envelope and forwards OpenAI-compatible fields
+> to you — so **the HTTP API you call is unchanged**; you always send and receive
+> standard OpenAI-style payloads. If DeepSeek replies with non-JSON text, the
+> worker sends a corrective-feedback prompt in the same conversation before
+> retrying. This mode mirrors PAF-ModelQwen and can be disabled server-side via
+> `JSON_API_CONFIG["enabled"] = False`.
+
+---
+
 ## ⚠️ Error Responses
 
 ### 400 Bad Request
@@ -616,13 +772,14 @@ curl http://16.79.2.204:9000/health | jq '.workers.busy_slots'
 
 ### Monitor Response Times
 
-Check `x_meta.processing_time_ms` in responses:
+Check `x_meta.response_time_ms` (worker scrape time) or `x_meta.response_time`
+(end-to-end seconds) in responses:
 
 ```bash
 curl -X POST http://16.79.2.204:9000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"Hi"}]}' \
-  | jq '.x_meta.processing_time_ms'
+  | jq '.x_meta.response_time_ms'
 ```
 
 ---
@@ -638,7 +795,7 @@ curl -X POST http://16.79.2.204:9000/v1/chat/completions \
 ### 2. Account Routing
 - Use `preferred_account` to distribute load across specific accounts
 - System automatically falls back if preferred account is busy
-- Check `x_meta.account_name` to see which account was used
+- Check `x_meta.account` to see which account was used
 
 ### 3. Error Handling
 - Implement retry logic for 429, 500, 504 errors
@@ -666,18 +823,34 @@ curl -X POST http://16.79.2.204:9000/v1/chat/completions \
 
 ## 📊 Response Metadata Fields
 
-All responses include an `x_meta` object with detailed information:
+All responses include an `x_meta` object with detailed information. Fields fall
+into two groups: **VPS-level** (set by the gateway) and **worker `x_metadata`**
+(folded in from the scraper, matching PAF-ModelQwen's `x_metadata` parity).
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `session_id` | string/null | Session identifier if persistence enabled |
-| `account_name` | string | Which DeepSeek account was used |
-| `conversation_url` | string | DeepSeek conversation URL (for debugging) |
-| `model_tab` | string | Tab used: "instant", "expert", or "vision" |
-| `deep_think` | boolean | Whether DeepThink was enabled |
-| `search` | boolean | Whether search was enabled |
-| `worker_id` | string | Which worker processed the request |
-| `processing_time_ms` | integer | Time taken to process (milliseconds) |
+| Field | Group | Type | Description |
+|-------|-------|------|-------------|
+| `session_id` | VPS | string/null | Session identifier if persistence enabled |
+| `mode` | VPS | string | Actual mode used by the worker: `"new"` or `"continue"` |
+| `mode_fallback` | VPS | boolean | `true` if `continue` fell back to `new` (session missing/expired) |
+| `account` | VPS | string | Which DeepSeek account was used |
+| `conversation_url` | VPS | string | DeepSeek conversation URL (for debugging) |
+| `model_tab` | VPS/worker | string | Tab used: `"instant"`, `"expert"`, or `"vision"` |
+| `deep_think` | VPS/worker | boolean | Whether DeepThink was enabled |
+| `web_search` | VPS/worker | boolean | Whether Search was enabled |
+| `response_time` | VPS | float | End-to-end VPS processing time (seconds) |
+| `timestamp` | VPS | float | Unix epoch when the response was built |
+| `model` | worker | string | Account name (worker view) |
+| `account_index` | worker | integer | Index of the account in the worker's rotation |
+| `account_status` | worker | string | Account health at response time (e.g. `"ok"`) |
+| `account_file` | worker | string | Profile dir backing the account |
+| `retry_count` | worker | integer | Retries the worker performed for this request |
+| `response_time_ms` | worker | integer | Worker scrape time in milliseconds |
+| `think_mode` | worker | null | Always `null` for DeepSeek (uses Layer 1/Layer 2, not think_mode) |
+
+> **Token usage** (`usage.prompt_tokens` / `completion_tokens` / `total_tokens`)
+> is computed with `tiktoken` `cl100k_base` on the worker for accuracy, falling
+> back to `len/4` only if `tiktoken` is unavailable — same approach as
+> PAF-ModelQwen.
 
 ---
 
@@ -690,7 +863,7 @@ RESPONSE=$(curl -s -X POST http://16.79.2.204:9000/v1/chat/completions \
   -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"Hi"}]}')
 
 echo $RESPONSE | jq -r '.choices[0].message.content'
-echo $RESPONSE | jq -r '.x_meta.account_name'
+echo $RESPONSE | jq -r '.x_meta.account'
 ```
 
 ### JavaScript/Node.js
@@ -752,6 +925,6 @@ For issues or questions:
 
 ---
 
-**Version**: 2.0.3  
-**Last Updated**: June 26, 2026  
+**Version**: 2.4.0  
+**Last Updated**: June 29, 2026  
 **Base URL**: http://16.79.2.204:9000

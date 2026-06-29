@@ -61,6 +61,32 @@ except Exception:
 log = get_logger("paf_deepseek.base")
 
 
+# --------------------------------------------------------------------------- #
+# Token counting (tiktoken cl100k_base, with len/4 fallback)
+# --------------------------------------------------------------------------- #
+# Parity with PAF-ModelQwen: accurate token counts via tiktoken when available,
+# falling back to the len/4 heuristic (same as scrapers.utils.estimate_tokens)
+# when tiktoken is not installed or encoding fails.
+try:  # pragma: no cover
+    import tiktoken as _tiktoken
+
+    _TK_ENC = _tiktoken.get_encoding("cl100k_base")
+except Exception:  # pragma: no cover
+    _TK_ENC = None
+
+
+def _count_tokens(text: str) -> int:
+    """Count tokens via tiktoken cl100k_base. Fallback to len/4 estimate."""
+    if not text:
+        return 0
+    if _TK_ENC is not None:
+        try:
+            return len(_TK_ENC.encode(text))
+        except Exception:
+            pass
+    return max(1, len(text) // 4)
+
+
 class BaseAIChatScraper(ABC):
     """Abstract base for browser-automation chat scrapers."""
 
@@ -794,19 +820,156 @@ class BaseAIChatScraper(ABC):
                     await asyncio.sleep(ROTATION_CONFIG["retry_delay"])
                     continue
 
-                ok, cleaned = self._validate_response(text)
-                if not ok:
-                    cleaned = self._repair_unescaped_quotes(cleaned)
-                    cleaned = self._repair_tool_calls_arguments(cleaned)
+                # ── Response handling ───────────────────────────────────────
+                # JSON API mode (parity w/ PAF-ModelQwen): DeepSeek was asked
+                # (via the [SYSTEM CONTEXT] wrapper built in send_prompt) to
+                # reply with a JSON envelope. Validate it; if invalid, send a
+                # corrective-feedback prompt in the SAME conversation up to
+                # max_corrective_retries before letting the outer retry/rotate
+                # loop take over. When disabled, fall back to lenient plain-text
+                # validation (original DeepSeek behaviour).
+                from config import JSON_API_CONFIG
+                _json_mode = (
+                    JSON_API_CONFIG.get("enabled", False)
+                    and hasattr(self, "_validate_deepseek_json_response")
+                )
 
-                return {
+                finish_reason = "stop"
+                tool_calls_list = None
+
+                if _json_mode:
+                    is_valid, parsed, verr = self._validate_deepseek_json_response(text)
+                    max_corr = JSON_API_CONFIG.get("max_corrective_retries", 2)
+                    corr = 0
+                    while not is_valid and corr < max_corr:
+                        corr += 1
+                        log.warning(
+                            "JSON response invalid (corrective %d/%d): %s | raw[:200]=%s",
+                            corr, max_corr, verr, (text or "")[:200],
+                        )
+                        if '"tool_calls"' in (text or ""):
+                            corrective_prompt = (
+                                "Your previous reply was not valid JSON. Reply with "
+                                "ONE single line of JSON only, no other text, using "
+                                "EXACTLY this schema:\n"
+                                '{"status":"tool_calls","tool_calls":[{"id":'
+                                '"call_<unique_id>","type":"function","function":'
+                                '{"name":"<function_name>","arguments":{<args_as_object>}}}]}'
+                            )
+                        else:
+                            corrective_prompt = (
+                                "Your previous reply was not valid JSON. Reply with "
+                                "ONE single line of JSON only, no other text, using "
+                                "EXACTLY this schema:\n"
+                                '{"status":"success","choices":[{"index":0,"message":'
+                                '{"role":"assistant","content":"<your full answer>"},'
+                                '"finish_reason":"stop"}]}'
+                            )
+                        await asyncio.sleep(ROTATION_CONFIG["retry_delay"])
+                        try:
+                            # Capture pre-send text for virtual-list change detection.
+                            _pre = await self._capture_pre_send_text()
+                            _init = await self._count_response_elements()
+                            # wrap_as_user_request=False: this IS a system
+                            # instruction, do not re-wrap it as a user request.
+                            await self.send_prompt(
+                                corrective_prompt,
+                                mode="continue",
+                                wrap_as_user_request=False,
+                            )
+                            text = await self.wait_for_response(
+                                response_selectors=self._response_selectors(),
+                                timeout=t["response_wait"],
+                                stability_secs=t["stability_check"],
+                                stability_polls=t["stability_polls"],
+                                poll_interval=t["poll_interval"],
+                                initial_response_count=_init,
+                                pre_send_text=_pre,
+                            )
+                        except Exception as corr_exc:  # noqa: BLE001
+                            log.warning("Corrective send failed: %s", corr_exc)
+                            break
+                        is_valid, parsed, verr = self._validate_deepseek_json_response(text)
+
+                    if not is_valid:
+                        last_error = f"invalid_json_response: {verr}"
+                        log.error(
+                            "JSON response still invalid after %d corrective tries", corr
+                        )
+                        retries += 1
+                        await asyncio.sleep(ROTATION_CONFIG["retry_delay"])
+                        continue
+
+                    if parsed.get("status") == "error":
+                        err_obj = parsed.get("error", {}) or {}
+                        last_error = err_obj.get("message") or "model returned error envelope"
+                        log.warning("Model returned error envelope: %s", last_error)
+                        retries += 1
+                        await asyncio.sleep(ROTATION_CONFIG["retry_delay"])
+                        continue
+
+                    if parsed.get("status") == "tool_calls":
+                        tool_calls_list = parsed.get("tool_calls", [])
+                        finish_reason = "tool_calls"
+                        cleaned = ""
+                        log.info(
+                            "JSON response: tool_calls (%d call(s))", len(tool_calls_list)
+                        )
+                    else:
+                        cleaned = parsed["choices"][0]["message"]["content"]
+                        finish_reason = parsed["choices"][0].get("finish_reason", "stop")
+                else:
+                    ok, cleaned = self._validate_response(text)
+                    if not ok:
+                        cleaned = self._repair_unescaped_quotes(cleaned)
+                        cleaned = self._repair_tool_calls_arguments(cleaned)
+
+                # --- Token usage (tiktoken parity with PAF-ModelQwen) --------
+                prompt_tokens = _count_tokens(prompt)
+                completion_tokens = _count_tokens(cleaned)
+                response_time_ms = int((_t_wait - _t0) * 1000)
+
+                # --- x_metadata (parity with PAF-ModelQwen, DeepSeek-flavored)
+                try:
+                    account_file = str(self._profile_dir_for(self.account))
+                except Exception:
+                    account_file = ""
+                x_metadata = {
+                    "model":            self.account,
+                    "account_file":     account_file,
+                    "account_index":    self._account_index,
+                    "timestamp":        int(time.time()),
+                    "account_status":   "ok",
+                    "retry_count":      retries,
+                    "response_time_ms": response_time_ms,
+                    "think_mode":       None,  # DeepSeek uses Layer 1/Layer 2, not think_mode
+                    "model_tab":        merged_kwargs.get(
+                        "model_tab", DEEPSEEK_CONFIG["default_model_tab"]
+                    ),
+                    "deep_think":       merged_kwargs.get("deep_think", False),
+                    "web_search":       merged_kwargs.get("web_search", False),
+                }
+
+                result = {
                     "ok": True,
+                    "success": True,          # OpenAI-compat alias
+                    "finish_reason": finish_reason,
                     "mode": mode,
                     "account": self.account,
-                    "text": cleaned,
+                    "text": cleaned,          # backward-compat key
+                    "response": cleaned,      # Qwen-style key
                     "code_blocks": self.extract_code_blocks(cleaned),
                     "timestamp": datetime.now().astimezone().isoformat(),
+                    "usage": {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": prompt_tokens + completion_tokens,
+                    },
+                    "x_metadata": x_metadata,
                 }
+                if tool_calls_list is not None:
+                    result["tool_calls"] = tool_calls_list
+                return result
 
             except Exception as exc:  # noqa: BLE001
                 last_error = str(exc)

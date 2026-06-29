@@ -287,7 +287,11 @@ class LocalWorker:
         
         self.pool = BrowserPool(num_slots=self.num_workers, headless=self.headless)
         await self.pool.start()
-        log.info("Worker pool ready: %s", self.pool.status_summary())
+        _s = self.pool.status_summary()
+        log.info(
+            "Worker pool ready: %d idle, %d busy, %d dead (total %d)",
+            _s["idle"], _s["busy"], _s["dead"], _s["total"],
+        )
 
         # Start interactive CLI in background thread
         threading.Thread(target=self._run_cli_loop, daemon=True).start()
@@ -326,7 +330,10 @@ class LocalWorker:
                         "token": self.token,
                         "hostname": socket.gethostname(),
                         "max_concurrent": self.num_workers,
-                        "accounts": self.pool.list_accounts() if self.pool else [],
+                        # VPS expects account-name strings; list_accounts() now
+                        # returns dicts, so extract the names for wire compat.
+                        "accounts": [a["account"] for a in self.pool.list_accounts()]
+                        if self.pool else [],
                     }
                 )
             )
@@ -524,6 +531,11 @@ class LocalWorker:
         web_search  = request.get("web_search", False)
         tool_msgs   = request.get("tool_messages")       # list[dict] for Turn 2
         preferred_account = request.get("preferred_account")
+        # JSON API mode / tool calling: forwarded from the VPS so the scraper
+        # can build the [SYSTEM CONTEXT]/[USER REQUEST] wrapper.
+        tools         = request.get("tools")
+        max_tokens    = request.get("max_tokens")
+        system_prompt = request.get("system_prompt")
 
         # Feature 12: Attachment support via base64
         attachments = None
@@ -571,7 +583,7 @@ class LocalWorker:
 
         # Feature 4: preferred_account routing with fallback
         if preferred_account:
-            available = self.pool.list_accounts()
+            available = [a["account"] for a in self.pool.list_accounts()]
             if preferred_account not in available:
                 log.warning(
                     "Preferred account %s not available, using fallback",
@@ -617,6 +629,9 @@ class LocalWorker:
                     attachments=attachments,
                     preferred_account=preferred_account,
                     conversation_url=conversation_url,
+                    tools=tools,
+                    max_tokens=max_tokens,
+                    system_prompt=system_prompt,
                 )
             elapsed = time.monotonic() - t0
 
@@ -721,7 +736,11 @@ class LocalWorker:
             accounts = self.pool.list_accounts()
             print(f"\n📋 Accounts ({len(accounts)}):")
             for i, acc in enumerate(accounts, 1):
-                print(f"  {i}. {acc}")
+                vis = " [visible]" if acc.get("no_headless") else ""
+                print(
+                    f"  {i}. {acc['account']} "
+                    f"(slot#{acc['slot_id']}, {acc['status']}){vis}"
+                )
             print()
 
         # add account NAME
@@ -734,7 +753,11 @@ class LocalWorker:
             if not self.pool:
                 print("❌ Pool not initialized")
                 return
-            print(f"\n📊 Pool Status: {self.pool.status_summary()}")
+            _s = self.pool.status_summary()
+            print(
+                f"\n📊 Pool Status: {_s['idle']} idle, {_s['busy']} busy, "
+                f"{_s['dead']} dead (total {_s['total']})"
+            )
             print(f"   Worker ID: {self.worker_id}")
             print(f"   Connected: {self._ws is not None}")
             print()
@@ -827,7 +850,8 @@ class LocalWorker:
                     {
                         "type": "update_accounts",
                         "worker_id": self.worker_id,
-                        "accounts": self.pool.list_accounts(),
+                        # VPS expects account-name strings (see register payload).
+                        "accounts": [a["account"] for a in self.pool.list_accounts()],
                     }
                 )
             )

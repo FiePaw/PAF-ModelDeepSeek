@@ -46,6 +46,15 @@ class DeepSeekScraper(BaseAIChatScraper):
         # Mirrors the same flag used by PAF-ModelQwen.
         self._conversation_started: bool = False
 
+        # --- JSON API mode (prompt wrapping) per-request state ------------
+        # Set by send_prompt() before building the [SYSTEM CONTEXT]/[USER
+        # REQUEST] wrapper. Reset is not required between calls; each request
+        # overwrites them (defaults applied when absent).
+        self._tools: Optional[list[dict]] = None
+        self._max_tokens: Optional[int] = None
+        self._system_prompt: Optional[str] = None
+        self._last_prompt: Optional[str] = None
+
     # ------------------------------------------------------------------ #
     # Generic selector helpers
     # ------------------------------------------------------------------ #
@@ -604,6 +613,10 @@ class DeepSeekScraper(BaseAIChatScraper):
         deep_think: bool = False,
         web_search: bool = False,
         attachments: Optional[list[str | Path]] = None,
+        wrap_as_user_request: bool = True,
+        tools: Optional[list[dict]] = None,
+        max_tokens: Optional[int] = None,
+        system_prompt: Optional[str] = None,
         **kwargs,
     ) -> str:
         """
@@ -628,6 +641,24 @@ class DeepSeekScraper(BaseAIChatScraper):
         """
         # --- TIMING instrumentation (sub-stages of send_prompt) -------------
         _s0 = time.monotonic()
+
+        # --- JSON API mode: wrap prompt in [SYSTEM CONTEXT]/[USER REQUEST] ---
+        # Store per-request state so _build_wrapped_prompt() can embed tools,
+        # max_tokens, and any client system prompt. Corrective-feedback sends
+        # pass wrap_as_user_request=False (the message is already an
+        # instruction, not a new user request) so they are sent verbatim.
+        self._tools = tools
+        self._max_tokens = max_tokens
+        self._system_prompt = system_prompt
+        self._last_prompt = prompt
+
+        from config import JSON_API_CONFIG  # keep base import-light
+        _json_mode = JSON_API_CONFIG.get("enabled", False)
+        outgoing_prompt = (
+            self._build_wrapped_prompt(prompt)
+            if (_json_mode and wrap_as_user_request)
+            else prompt
+        )
 
         # Sole navigation gate — decides new chat vs continue existing thread.
         await self._ensure_page_ready(mode)
@@ -666,10 +697,18 @@ class DeepSeekScraper(BaseAIChatScraper):
                 "Chat input not found (TODO: verify #chat-input selector)."
             )
         await input_loc.click()
-        # Type the prompt. type_delay_ms is 0 by default (see config) so key
-        # events still fire per character but without artificial latency.
+        # Clear any existing content, then set the full prompt via fill().
+        #
+        # CRITICAL: Use fill() — NOT type() — to insert the prompt.
+        # type() simulates per-character keypresses; newline characters
+        # (\n) in multi-line prompts are interpreted as Enter key presses,
+        # which prematurely submits the chat form and truncates the prompt
+        # at the first newline. fill() sets the value programmatically via
+        # the DOM without firing per-character key events, so newlines are
+        # inserted as literal text in the textarea. (Same approach as
+        # PAF-ModelQwen's send_prompt.)
         await input_loc.fill("")
-        await input_loc.type(prompt, delay=BROWSER_CONFIG.get("type_delay_ms", 0))
+        await input_loc.fill(outgoing_prompt)
         await asyncio.sleep(_T["between_actions"])
         _s_type = time.monotonic()
 
@@ -748,6 +787,25 @@ class DeepSeekScraper(BaseAIChatScraper):
                 + _json.dumps({"prompt": next_user_msg}, ensure_ascii=False)
             )
 
+        # In JSON API mode, remind the model to keep replying with the JSON
+        # envelope (it may emit either a final `success` answer or another
+        # `tool_calls` request after seeing the tool result).
+        from config import JSON_API_CONFIG
+        _json_mode = JSON_API_CONFIG.get("enabled", False)
+        if _json_mode:
+            parts.insert(
+                0,
+                "[SYSTEM CONTEXT]\n"
+                "Continue acting as a JSON API endpoint. After reading the tool "
+                "result(s) below, reply with ONE single line of JSON only "
+                "(no markdown, no extra text) using EXACTLY one of:\n"
+                '{"status":"success","choices":[{"index":0,"message":{"role":'
+                '"assistant","content":"<final answer>"},"finish_reason":"stop"}]}\n'
+                "or, if you need another function call:\n"
+                '{"status":"tool_calls","tool_calls":[{"id":"call_<id>","type":'
+                '"function","function":{"name":"<name>","arguments":{<args>}}}]}',
+            )
+
         wrapped_prompt = "\n\n".join(parts)
 
         log.info(
@@ -765,7 +823,10 @@ class DeepSeekScraper(BaseAIChatScraper):
             # TEXT-CHANGE detection: capture last visible text before sending.
             pre_send_text = await self._capture_pre_send_text()
             initial_response_count = await self._count_response_elements()
-            await self.send_prompt(wrapped_prompt, mode="continue")
+            # wrap_as_user_request=False: this prompt is already a fully
+            # structured [SYSTEM CONTEXT]/[TOOL RESULT]/[USER REQUEST] envelope;
+            # do NOT let send_prompt re-wrap it.
+            await self.send_prompt(wrapped_prompt, mode="continue", wrap_as_user_request=False)
 
             from config import DEEPSEEK_CONFIG as _DS_CFG
             t = _DS_CFG["timeouts"]
@@ -779,19 +840,61 @@ class DeepSeekScraper(BaseAIChatScraper):
                 pre_send_text=pre_send_text,
             )
 
-            ok, cleaned = self._validate_response(text)
-            if not ok:
-                cleaned = self._repair_unescaped_quotes(cleaned)
-                cleaned = self._repair_tool_calls_arguments(cleaned)
+            finish_reason = "stop"
+            tool_calls_list = None
 
-            return {
+            if _json_mode:
+                is_valid, parsed, verr = self._validate_deepseek_json_response(text)
+                if not is_valid:
+                    log.warning(
+                        "tool-result JSON invalid: %s | raw[:200]=%s",
+                        verr, (text or "")[:200],
+                    )
+                    return {
+                        "ok":        False,
+                        "success":   False,
+                        "mode":      "continue",
+                        "account":   self.account,
+                        "error":     f"invalid_json_response: {verr}",
+                        "timestamp": datetime.now().astimezone().isoformat(),
+                    }
+                if parsed.get("status") == "error":
+                    err_obj = parsed.get("error", {}) or {}
+                    return {
+                        "ok":        False,
+                        "success":   False,
+                        "mode":      "continue",
+                        "account":   self.account,
+                        "error":     err_obj.get("message") or "model error envelope",
+                        "timestamp": datetime.now().astimezone().isoformat(),
+                    }
+                if parsed.get("status") == "tool_calls":
+                    tool_calls_list = parsed.get("tool_calls", [])
+                    finish_reason = "tool_calls"
+                    cleaned = ""
+                else:
+                    cleaned = parsed["choices"][0]["message"]["content"]
+                    finish_reason = parsed["choices"][0].get("finish_reason", "stop")
+            else:
+                ok, cleaned = self._validate_response(text)
+                if not ok:
+                    cleaned = self._repair_unescaped_quotes(cleaned)
+                    cleaned = self._repair_tool_calls_arguments(cleaned)
+
+            result = {
                 "ok":          True,
+                "success":     True,
+                "finish_reason": finish_reason,
                 "mode":        "continue",
                 "account":     self.account,
                 "text":        cleaned,
+                "response":    cleaned,
                 "code_blocks": self.extract_code_blocks(cleaned),
                 "timestamp":   datetime.now().astimezone().isoformat(),
             }
+            if tool_calls_list is not None:
+                result["tool_calls"] = tool_calls_list
+            return result
         except Exception as exc:
             log.error("scrape_with_tool_result error: %s", exc, exc_info=True)
             await self.take_debug_screenshot("tool_result_error")
@@ -1004,6 +1107,175 @@ class DeepSeekScraper(BaseAIChatScraper):
             if phrase in low:
                 return False, raw
         return True, raw.strip()
+
+    # ------------------------------------------------------------------ #
+    # JSON API mode — prompt wrapping + structured-response validation
+    # (parity with PAF-ModelQwen's _build_wrapped_prompt /
+    #  _validate_qwen_response). Only active when JSON_API_CONFIG["enabled"].
+    # ------------------------------------------------------------------ #
+    def _build_wrapped_prompt(self, prompt: str) -> str:
+        """
+        Wrap a user prompt into the [SYSTEM CONTEXT] / [USER REQUEST] envelope.
+
+        Plain chat (no tools):
+            [SYSTEM CONTEXT]
+            You are operating as a JSON API endpoint ...
+            (schema for {"status":"success","choices":[...]})
+
+            [USER REQUEST]
+            {"prompt": "...", "model": "<account>"}
+
+        Tool calling (tools present):
+            [SYSTEM CONTEXT]
+            You are a pure JSON API endpoint ...
+            AVAILABLE FUNCTIONS: [ ... ]
+            (schema for tool_calls OR success)
+
+            [USER REQUEST]
+            {"prompt": "...", "model": "<account>", "max_tokens": N}
+
+        The wrapper is what makes DeepSeek emit a parseable envelope instead of
+        free-form markdown. Mirrors qwen_scraper._build_wrapped_prompt.
+        """
+        from config import JSON_API_CONFIG
+
+        account_name = self.account or "deepseek"
+        user_request: dict = {"prompt": prompt, "model": account_name}
+        if self._max_tokens is not None:
+            user_request["max_tokens"] = self._max_tokens
+
+        parts: list[str] = ["[SYSTEM CONTEXT]"]
+
+        # Optional client-supplied system prompt is prepended verbatim.
+        if self._system_prompt:
+            parts += [self._system_prompt.strip(), ""]
+
+        if self._tools:
+            # ── Tool-calling mode ───────────────────────────────────────
+            # Avoid the literal word that triggers DeepSeek's internal tool
+            # registry; describe them as client-side "functions" instead.
+            tool_names = [
+                t.get("function", {}).get("name", "")
+                for t in self._tools
+                if t.get("function", {}).get("name")
+            ]
+            parts += [
+                "You are a pure JSON API endpoint. You do NOT have any built-in",
+                "capabilities (no web search, no code execution, no file access,",
+                "no image generation). You are a stateless text-in / JSON-out",
+                "processor.",
+                "",
+                "The client system has its own external executor that can run",
+                "the following named functions on your behalf:",
+                "",
+                "AVAILABLE FUNCTIONS (client-side, executed externally):",
+                json.dumps(self._tools, ensure_ascii=False, indent=2),
+                "",
+                f"These are the ONLY function names you may request: {tool_names}",
+                "Do NOT invent or use any other function name.",
+                "",
+                "RESPONSE FORMAT — choose exactly ONE, ONE line of JSON only:",
+                "",
+                "A) If you need the client to execute a function before you can answer:",
+                '{"status":"tool_calls","tool_calls":[{"id":"call_<unique_id>",'
+                '"type":"function","function":{"name":"<function_name>",'
+                '"arguments":{<args_as_object>}}}]}',
+                "",
+                "B) If you have enough information to give a final answer:",
+                '{"status":"success","choices":[{"index":0,"message":{"role":'
+                '"assistant","content":"<full_answer>"},"finish_reason":"stop"}]}',
+                "",
+                "RULES:",
+                "- Output ONLY raw JSON. No markdown, no explanation, no extra text.",
+                "- arguments MUST be a JSON object (dict), NOT a string.",
+                "- id MUST be unique per call, format: call_<number_or_letters>.",
+                "- Do NOT add any field outside the schemas above.",
+                f"- Only use function names from this list: {tool_names}.",
+            ]
+        else:
+            # ── Plain chat mode ─────────────────────────────────────────
+            parts.append(JSON_API_CONFIG["chat_system_instruction"])
+
+        parts += ["", "[USER REQUEST]", json.dumps(user_request, ensure_ascii=False)]
+        return "\n".join(parts)
+
+    def _validate_deepseek_json_response(
+        self, raw: str
+    ) -> "tuple[bool, dict | None, str]":
+        """
+        Validate that a DeepSeek response is a JSON envelope with one of:
+          success:    {"status":"success","choices":[{"index":0,"message":
+                       {"role":"assistant","content":"..."},"finish_reason":"stop"}]}
+          tool_calls: {"status":"tool_calls","tool_calls":[ ... ]}
+          error:      {"status":"error","error":{"type":"...","message":"..."}}
+
+        Returns (is_valid, parsed_dict | None, error_reason).
+
+        DeepSeek often renders the JSON with surrounding markdown/code-fences or
+        unescaped quotes; this method strips fences and applies the inherited
+        repair helpers (_repair_tool_calls_arguments / _repair_unescaped_quotes)
+        before giving up.
+        """
+        if not raw or not raw.strip():
+            return False, None, "empty response"
+
+        candidate = self._strip_json_fences(raw.strip())
+
+        def _try_parse(s: str):
+            try:
+                return json.loads(s), None
+            except json.JSONDecodeError as exc:
+                return None, str(exc)
+
+        data, err = _try_parse(candidate)
+        if data is None:
+            repaired = None
+            if '"tool_calls"' in candidate or '"arguments"' in candidate:
+                repaired = self._repair_tool_calls_arguments(candidate)
+            if repaired is None or repaired == candidate:
+                repaired = self._repair_unescaped_quotes(candidate)
+            if repaired and repaired != candidate:
+                data, err2 = _try_parse(repaired)
+                if data is None:
+                    return False, None, f"JSON parse error: {err} | repair failed: {err2}"
+            else:
+                return False, None, f"JSON parse error: {err}"
+
+        if not isinstance(data, dict):
+            return False, None, "top-level JSON is not an object"
+
+        status = data.get("status")
+        if status == "tool_calls":
+            tcs = data.get("tool_calls")
+            if not isinstance(tcs, list) or not tcs:
+                return False, None, "status=tool_calls but tool_calls missing/empty"
+            return True, data, ""
+        if status == "error":
+            # A well-formed error envelope is "valid" JSON; the caller decides.
+            return True, data, ""
+        if status == "success":
+            choices = data.get("choices")
+            if not isinstance(choices, list) or not choices:
+                return False, None, "status=success but choices missing/empty"
+            msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+            if not isinstance(msg, dict) or not isinstance(msg.get("content"), str):
+                return False, None, "choices[0].message.content missing or not a string"
+            return True, data, ""
+
+        return False, None, f"unknown or missing status: {status!r}"
+
+    @staticmethod
+    def _strip_json_fences(text: str) -> str:
+        """Remove leading/trailing markdown code fences around a JSON payload."""
+        t = text.strip()
+        if t.startswith("```"):
+            # drop opening fence line (``` or ```json) and trailing fence
+            first_nl = t.find("\n")
+            if first_nl != -1:
+                t = t[first_nl + 1:]
+            if t.rstrip().endswith("```"):
+                t = t.rstrip()[: -3]
+        return t.strip()
 
     def _extra_send_kwargs(self) -> dict:
         return {

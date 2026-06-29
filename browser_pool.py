@@ -90,8 +90,26 @@ class BrowserPool:
             return None
         return self._accounts[index % len(self._accounts)]
 
-    def list_accounts(self) -> list[str]:
-        return list(self._accounts)
+    def list_accounts(self) -> list[dict]:
+        """
+        Return per-slot account info (parity with PAF-ModelQwen).
+
+        Each entry: {"account", "status", "slot_id", "no_headless"}.
+        `no_headless` is True when the account's effective headless mode is
+        False (i.e. the browser is running visible).
+        """
+        result: list[dict] = []
+        for slot in self.slots:
+            effective_headless = self._account_headless.get(slot.account, self.headless)
+            result.append(
+                {
+                    "account":     slot.account or "",
+                    "status":      slot.status.value,
+                    "slot_id":     slot.index,
+                    "no_headless": effective_headless is False,
+                }
+            )
+        return result
 
     def busy_accounts(self) -> list[str]:
         return [s.account for s in self.slots if s.status == SlotStatus.BUSY and s.account]
@@ -661,11 +679,17 @@ class BrowserPool:
     # ------------------------------------------------------------------ #
     # Status
     # ------------------------------------------------------------------ #
-    def status_summary(self) -> str:
-        idle = sum(1 for s in self.slots if s.status == SlotStatus.IDLE)
-        busy = sum(1 for s in self.slots if s.status == SlotStatus.BUSY)
-        dead = sum(1 for s in self.slots if s.status == SlotStatus.DEAD)
-        return f"{idle} idle, {busy} busy, {dead} dead"
+    def status_summary(self) -> dict:
+        """Return slot status counts as a dict (parity with PAF-ModelQwen)."""
+        counts = {s: 0 for s in SlotStatus}
+        for slot in self.slots:
+            counts[slot.status] += 1
+        return {
+            "total": len(self.slots),
+            "idle":  counts[SlotStatus.IDLE],
+            "busy":  counts[SlotStatus.BUSY],
+            "dead":  counts[SlotStatus.DEAD],
+        }
 
     # ------------------------------------------------------------------ #
     # Per-account headless control

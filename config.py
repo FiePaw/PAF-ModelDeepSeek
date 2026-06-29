@@ -508,3 +508,53 @@ LOG_CONFIG: dict = {
     "use_color": True,
     "use_emoji": True,
 }
+
+
+# --------------------------------------------------------------------------- #
+# JSON API mode (prompt wrapping + structured response) — parity w/ Qwen
+# --------------------------------------------------------------------------- #
+# When enabled, every user prompt is wrapped in a [SYSTEM CONTEXT] / [USER
+# REQUEST] envelope (see DeepSeekScraper._build_wrapped_prompt) instructing
+# DeepSeek to reply with a single-line JSON envelope:
+#
+#   {"status":"success","choices":[{"index":0,"message":{"role":"assistant",
+#    "content":"..."},"finish_reason":"stop"}]}
+#
+# or, when tool calling is requested:
+#
+#   {"status":"tool_calls","tool_calls":[{"id":"call_...","type":"function",
+#    "function":{"name":"...","arguments":{...}}}]}
+#
+# The scraper parses this envelope, extracts content / tool_calls, and forwards
+# OpenAI-compatible fields to the VPS. If DeepSeek replies with non-JSON text
+# (e.g. it ignored the format), a corrective-feedback prompt is sent in the
+# SAME conversation up to `max_corrective_retries` times before the attempt is
+# treated as failed (and the outer scrape() retry/rotation logic takes over).
+#
+# NOTE: This relies on DeepSeek honouring the in-message [SYSTEM CONTEXT].
+# Unlike Qwen, DeepSeek has no per-account "Custom Instruction" field, so the
+# enforcement lives entirely in the wrapped prompt. Set "enabled": False to
+# revert to the original plain-text markdown behaviour.
+JSON_API_CONFIG: dict = {
+    "enabled": True,
+    # Max in-session corrective retries when the response is not valid JSON.
+    "max_corrective_retries": 2,
+    # Base [SYSTEM CONTEXT] instruction used for plain chat (no tools).
+    "chat_system_instruction": (
+        "You are operating as a JSON API endpoint, NOT a conversational "
+        "assistant.\n"
+        "Respond with ONE single line of VALID JSON only — no markdown, no "
+        "code fences, no explanations, and no text outside the JSON.\n"
+        "\n"
+        "RESPONSE FORMAT (use EXACTLY this schema):\n"
+        '{"status":"success","choices":[{"index":0,"message":{"role":'
+        '"assistant","content":"<your full answer as a string>"},'
+        '"finish_reason":"stop"}]}\n'
+        "\n"
+        "RULES:\n"
+        "- content MUST be a JSON string. Escape any double quotes as \\\" and "
+        "newlines as \\n.\n"
+        "- finish_reason MUST be \"stop\".\n"
+        "- Output ONE line only. Do NOT add any field outside the schema above."
+    ),
+}

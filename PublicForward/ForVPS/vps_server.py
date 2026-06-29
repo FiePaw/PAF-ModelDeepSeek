@@ -515,6 +515,17 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
                 for att in req.attachments
             ]
 
+        # Tool calling + JSON API mode: forward tools, max_tokens, and any
+        # system prompt so the worker can build the [SYSTEM CONTEXT]/[USER
+        # REQUEST] wrapper (parity with PAF-ModelQwen).
+        tools_payload = None
+        if req.tools:
+            tools_payload = [t.model_dump() for t in req.tools]
+        system_prompt = "\n\n".join(
+            m.content for m in req.messages
+            if m.role == "system" and isinstance(m.content, str) and m.content.strip()
+        ) or None
+
         # Dispatch to worker
         result = await worker_mgr.dispatch(
             prompt=req.last_user_message(),
@@ -525,6 +536,9 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
             web_search=web_search,
             attachments=attachments,
             preferred_account=req.preferred_account,
+            tools=tools_payload,
+            max_tokens=req.max_tokens,
+            system_prompt=system_prompt,
         )
 
         if not result.get("ok"):
@@ -532,8 +546,19 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
 
         # Build OpenAI-compatible response
         response_text = result.get("text", "")
-        prompt_tokens = _token_estimate(req.last_user_message())
-        completion_tokens = _token_estimate(response_text)
+        # Prefer the worker's accurate token usage (tiktoken cl100k_base).
+        # Falls back to the len/4 estimate if the worker did not supply it
+        # (e.g. older worker build). Parity with PAF-ModelQwen.
+        _worker_usage = result.get("usage") or {}
+        prompt_tokens = _worker_usage.get("prompt_tokens")
+        completion_tokens = _worker_usage.get("completion_tokens")
+        if prompt_tokens is None:
+            prompt_tokens = _token_estimate(req.last_user_message())
+        if completion_tokens is None:
+            completion_tokens = _token_estimate(response_text)
+        total_tokens = _worker_usage.get(
+            "total_tokens", prompt_tokens + completion_tokens
+        )
 
         # Feature 10: finish_reason and tool_calls support
         finish_reason = "stop"
@@ -573,6 +598,13 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
             "timestamp": time.time(),
         }
 
+        # Parity with PAF-ModelQwen: fold the worker's x_metadata
+        # (tiktoken-based response_time_ms, retry_count, account_index,
+        # account_status, account_file, model_tab, ...) into x_meta without
+        # clobbering VPS-set keys.
+        for _k, _v in (result.get("x_metadata") or {}).items():
+            x_meta.setdefault(_k, _v)
+
         response_data = {
             "id": _make_id(),
             "object": "chat.completion",
@@ -582,7 +614,7 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
             "usage": {
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
+                "total_tokens": total_tokens,
             },
             "x_meta": x_meta,  # Feature 11
         }
