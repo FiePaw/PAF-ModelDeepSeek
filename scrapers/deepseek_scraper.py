@@ -868,7 +868,7 @@ class DeepSeekScraper(BaseAIChatScraper):
         # Invalid JSON — return error immediately, no retry (Qwen pattern)
         log.warning(
             "tool-result JSON invalid: %s | raw[:200]=%s",
-            err, (response_text or "")[:200],
+            err, (text or "")[:200],
         )
         return {
             "ok":      False,
@@ -876,7 +876,7 @@ class DeepSeekScraper(BaseAIChatScraper):
             "mode":    "continue",
             "account": self.account,
             "error":   f"Invalid response after tool result: {err}",
-            "raw":     response_text,
+            "raw":     text,
         }
     # ------------------------------------------------------------------ #
     # Attachments — CDP clipboard inject + Ctrl+V (NOT <input type=file>)
@@ -1202,16 +1202,45 @@ class DeepSeekScraper(BaseAIChatScraper):
         data, err = _try_parse(candidate)
         if data is None:
             repaired = None
-            if '"tool_calls"' in candidate or '"arguments"' in candidate:
-                repaired = self._repair_tool_calls_arguments(candidate)
-            if repaired is None:
-                repaired = self._repair_unescaped_quotes(candidate)
-            if repaired is not None and repaired != candidate:
-                data, err2 = _try_parse(repaired)
-                if data is None:
-                    return False, None, f"JSON parse error: {err} | repair failed: {err2}"
-            else:
-                return False, None, f"JSON parse error: {err}"
+            # Repair pass 0: fix invalid backslash escapes (e.g. Windows paths
+            #                "C:\Users\..." → "C:\\Users\\...").  Applied first
+            #                because \X errors block all subsequent parsing.
+            bs_fixed = self._fix_invalid_backslashes(candidate)
+            if bs_fixed:
+                data, err = _try_parse(bs_fixed)
+                if data is not None:
+                    candidate = bs_fixed  # use fixed version for downstream
+            # Repair pass 0.5: fix missing ']' for choices array
+            #   DeepSeek sometimes outputs '}}' instead of '}]}', leaving the
+            #   choices array unclosed. Applied before content repairs.
+            if data is None:
+                bracket_fixed = self._repair_unbalanced_brackets(candidate)
+                if bracket_fixed:
+                    data, err = _try_parse(bracket_fixed)
+                    if data is not None:
+                        candidate = bracket_fixed
+            if data is None:
+                # Repair pass 1: tool_calls arguments (unescaped inner quotes)
+                if '"tool_calls"' in candidate or '"arguments"' in candidate:
+                    repaired = self._repair_tool_calls_arguments(candidate)
+                # Repair pass 2: unescaped quotes in content (legacy heuristic)
+                if repaired is None:
+                    repaired = self._repair_unescaped_quotes(candidate)
+                # Repair pass 3: robust content-field repair (unbalanced braces,
+                #                unescaped quotes, literal newlines, near/hard truncation)
+                if repaired is None:
+                    repaired = self._repair_content_field(candidate)
+                # Repair pass 4: regex-based content extraction (absolute last
+                #                resort — reconstructs clean JSON from Python dict,
+                #                works for any truncation or structural issue)
+                if repaired is None:
+                    repaired = self._repair_by_regex(candidate)
+                if repaired is not None and repaired != candidate:
+                    data, err2 = _try_parse(repaired)
+                    if data is None:
+                        return False, None, f"JSON parse error: {err} | repair failed: {err2}"
+                else:
+                    return False, None, f"JSON parse error: {err}"
 
         if not isinstance(data, dict):
             return False, None, "top-level JSON is not an object"
@@ -1221,6 +1250,14 @@ class DeepSeekScraper(BaseAIChatScraper):
             tcs = data.get("tool_calls")
             if not isinstance(tcs, list) or not tcs:
                 return False, None, "status=tool_calls but tool_calls missing/empty"
+            # Normalize: arguments must be a JSON-encoded string (OpenAI spec).
+            # DeepSeek sometimes outputs arguments as a raw dict object.
+            for tc in tcs:
+                func = tc.get("function") if isinstance(tc, dict) else None
+                if isinstance(func, dict):
+                    args = func.get("arguments")
+                    if isinstance(args, dict):
+                        func["arguments"] = json.dumps(args, ensure_ascii=False)
             return True, data, ""
         if status == "error":
             # A well-formed error envelope is "valid" JSON; the caller decides.

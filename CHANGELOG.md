@@ -5,6 +5,156 @@ Format: `[version] YYYY-MM-DD — summary`
 
 ---
 
+## [2.5.1] 2026-06-30 — JSON repair overhaul + tool-result pipeline bug fixes
+
+Rilis ini memperbaiki **8 bug** yang ditemukan selama sesi pengujian Turn 2
+(tool-result injection) dan JSON API mode. Fokus utama adalah ketahanan parser
+JSON terhadap berbagai malformasi output DeepSeek: unescaped quotes, backslash
+ilegal, bracket hilang, truncation virtual scroll, dan kombinasi beberapa masalah
+sekaligus.
+
+---
+
+### Bug Fixes
+
+#### `scrapers/deepseek_scraper.py` — `NameError: response_text` di `scrape_with_tool_result()` (CRITICAL)
+
+- **Root cause:** Variabel hasil `wait_for_response()` di `scrape_with_tool_result()`
+  dinamai `text` (baris 825), tetapi error handler di bawahnya masih referensi
+  ke nama lama `response_text` yang tidak pernah dideklarasikan.
+- **Dampak:** Setiap tool-result turn yang menghasilkan JSON invalid langsung crash
+  dengan `NameError` alih-alih mengembalikan error terstruktur. Slot browser
+  di-respawn tidak perlu karena crash dianggap "dead".
+- **Fix:** Ganti dua kemunculan `response_text` → `text` di blok error handler
+  `scrape_with_tool_result()`.
+
+---
+
+#### `PublicForward/ForVPS/vps_server.py` — Tool result "stuck loop" — setiap pesan dianggap Turn 2 (CRITICAL)
+
+- **Root cause:** VPS mengekstrak `tool_messages` dari **semua** `role="tool"` dalam
+  history tanpa memperhatikan apakah tool results tersebut sudah diproses.
+  Pada Turn 3+, history masih mengandung tool messages lama → `tool_messages ≠ None`
+  → worker selalu masuk ke `scrape_with_tool_result()` → model menerima prompt
+  yang sama berulang → respons generic ("Halo! Ada yang bisa saya bantu?").
+- **Dampak:** Setelah satu siklus tool call selesai, semua pesan berikutnya dalam
+  sesi yang sama mengulang tool-result turn alih-alih melanjutkan percakapan normal.
+- **Fix:** `tool_messages` hanya di-forward jika **assistant message terakhir**
+  dalam history memiliki `tool_calls` (model baru saja minta tool, belum dibalas).
+  Pesan biasa pada Turn 3+: last assistant = pesan teks biasa → `tool_calls = None`
+  → `tool_messages = None` → route ke `run_task(mode=continue)`.
+
+```python
+# SEBELUM (bug):
+tool_messages = [... for m in req.messages if m.role == "tool"] or None
+
+# SESUDAH (fix):
+_last_asst = next((m for m in reversed(req.messages) if m.role == "assistant"), None)
+_prev_was_tool_call = _last_asst is not None and _last_asst.tool_calls is not None
+tool_messages = ([...] if _prev_was_tool_call else None) or None
+```
+
+---
+
+#### `scrapers/base_scraper.py` — JSON repair overhaul (5 perbaikan sekaligus)
+
+DeepSeek menghasilkan berbagai malformasi JSON yang berbeda tergantung konten
+respons. Semua kasus sekarang ditangani oleh **repair chain berlapis**.
+
+##### Pass 0 — `_fix_invalid_backslashes()` (BARU)
+- **Kasus:** Windows path seperti `"C:\Users\SPIN\..."` — karakter `\U`, `\S`, `\D`
+  bukan JSON escape sequence valid → `Invalid \escape` error.
+- **Cara kerja:** Scan JSON char-by-char di dalam string literal; ganti setiap
+  `\X` (X bukan `"`, `\\`, `/`, `b`, `f`, `n`, `r`, `t`, `u`) dengan `\\X`.
+  Return `None` jika tidak ada perubahan (no-op pada JSON valid).
+- **Bonus:** Setelah parse sukses, jika `arguments` dalam tool_calls adalah
+  `dict` (bukan string), di-serialize ke `json.dumps()` untuk parity OpenAI spec.
+
+##### Pass 0.5 — `_repair_unbalanced_brackets()` (BARU)
+- **Kasus:** DeepSeek sering mengakhiri JSON dengan `}}` bukan `}]}` — choices
+  array tidak pernah ditutup dengan `]` → `Expecting ',' delimiter` di karakter
+  terakhir.
+- **Cara kerja:** Hitung `count('[') - count(']')`. Jika unbalanced sebanyak N,
+  sisipkan N `]` sebelum N `}` penutup terakhir.
+- **Contoh:** `...,"finish_reason":"stop"}}` → `...,"finish_reason":"stop"}]}`
+
+##### Pass 3 — `_repair_content_field()` (DITINGKATKAN)
+- **Kasus sebelumnya:** Hanya mencari tail pattern via `rfind`. Jika tidak ada tail
+  (JSON ter-truncate oleh virtual scroll), return `None`.
+- **Tambahan Stage A (near-truncation):** Scan **maju** (bukan mundur) dalam 100 char
+  terakhir `inner_raw` untuk menemukan `"` yang diikuti `}`, `,`, atau `]`. Scan
+  maju memastikan kita menemukan penutup konten **asli** lebih dulu sebelum
+  menemukan marker JSON envelope seperti `"stop"}}`.
+  - **Fix scan direction bug:** Sebelumnya scan mundur — menemukan `"` di `"stop"}}`
+    lebih dulu → `inner_raw` menyertakan partial tail → konten polluted.
+- **Tambahan Stage B (hard truncation):** Jika tidak ada penutup sama sekali,
+  escape seluruh `inner_raw` sebagai konten dan paksa tutup envelope dengan
+  `","finish_reason":"stop"}]}`.
+- **Tambahan tail pattern:** `'"},"finish_reason":"stop"}}'` (variant `}}`)
+  di-handle melalui `_balance()` yang menambahkan `]` yang hilang.
+
+##### Pass 4 — `_repair_by_regex()` (BARU)
+- **Kasus:** Last resort jika semua pass sebelumnya gagal atau menghasilkan JSON
+  yang secara teknis valid tapi konten salah.
+- **Cara kerja:** Ekstrak nilai `content` via regex `(?:[^"\\]|\\.)*` (DOTALL),
+  decode JSON escape sequence, lalu rekonstruksi envelope bersih dari Python dict
+  menggunakan `json.dumps()`. Output **selalu valid JSON** jika ada key `content`.
+- Tidak berlaku untuk tool_calls response (tidak ada `content` → return `None`).
+
+---
+
+#### `scrapers/deepseek_scraper.py` — Repair chain loop-based (ROMBAKAN)
+
+- **Masalah lama:** Chain `if repaired is None` berhenti di repair pertama yang
+  return non-None, meskipun hasilnya masih invalid JSON. Misalnya: Pass 2
+  (`_repair_unescaped_quotes`) memperbaiki unescaped quote tapi menghasilkan
+  string yang masih punya `}}` → chain berhenti → "repair failed".
+- **Fix:** Ganti if-chain dengan **for loop** over `_repair_fns`:
+  1. Setiap pass dicoba secara berurutan.
+  2. Jika satu pass menghasilkan non-None tapi `_try_parse()` masih gagal,
+     lanjut ke pass berikutnya (tidak berhenti).
+  3. Setelah setiap pass, **post-process** dengan `_repair_unbalanced_brackets()`
+     untuk menangani kombinasi bug (unescaped quote + missing `]`).
+  4. Break saat ada pass yang menghasilkan valid JSON.
+
+---
+
+### Repair Chain Lengkap (v2.5.1)
+
+| Pass | Fungsi | Kasus |
+|------|--------|-------|
+| 0 | `_fix_invalid_backslashes` | `\U`, `\S`, `\D` — Windows path |
+| 0.5 | `_repair_unbalanced_brackets` | `}}` → `}]}` (missing `]`) |
+| 1 | `_repair_tool_calls_arguments` | Unescaped quote di `arguments` dict |
+| 2 | `_repair_unescaped_quotes` | Unescaped quote dalam `content` (heuristic) |
+| 3 | `_repair_content_field` | Truncation (Stage A maju + Stage B hard), unbalanced brace |
+| 4 | `_repair_by_regex` | Regex extraction → `json.dumps()` (last resort) |
+| post | `_repair_unbalanced_brackets` | Post-process setiap hasil pass 1–4 |
+
+### Regression Tests (semua pass ✅)
+
+| # | Skenario | Via |
+|---|----------|-----|
+| 1 | Valid response | direct parse |
+| 2 | Missing `]` (`}}` → `}]}`) | pass 0.5 |
+| 3 | Unescaped `"Halo Fie"` + missing `]` | pass 3 (Stage A forward) |
+| 4 | Windows path `C:\Users\` | pass 0 |
+| 5 | JSON truncated mid-sentence (virtual scroll) | pass 3 (Stage B) |
+| 6 | JSON near-truncated (`finish_reason` terpotong) | pass 3 (Stage A) |
+| 7 | Literal `\n` dalam content | pass 3 |
+| 8 | `tool_calls` dengan `arguments` sebagai dict | direct parse + normalisasi |
+
+### Files Modified
+
+| File | Perubahan |
+|------|-----------|
+| `scrapers/base_scraper.py` | `_fix_invalid_backslashes` (pass 0), `_repair_unbalanced_brackets` (pass 0.5), `_repair_content_field` v3 (Stage A forward scan, Stage B, tail pattern `}}`), `_repair_by_regex` (pass 4) |
+| `scrapers/deepseek_scraper.py` | Fix `NameError: response_text`; arguments dict→string normalization; loop-based repair chain dengan bracket post-processing |
+| `PublicForward/ForVPS/vps_server.py` | `tool_messages` hanya di-forward jika last assistant punya `tool_calls` |
+| `CHANGELOG.md` | Entri ini |
+
+---
+
 ## [2.5.0] 2026-06-30 — Qwen-aligned tool calling + repair parity + VPS tool forwarding
 
 Rilis ini membawa tool calling PAF-ModelDeepSeek ke **paritas penuh** dengan

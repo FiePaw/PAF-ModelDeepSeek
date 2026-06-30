@@ -653,6 +653,54 @@ class BaseAIChatScraper(ABC):
             return None
 
     @staticmethod
+    def _repair_unbalanced_brackets(raw: str) -> "str | None":
+        """
+        Fix JSON where array closing brackets are missing.
+
+        DeepSeek sometimes outputs '}}' instead of '}]}': the choices array
+        '[' is opened but never closed with ']'. This causes:
+          "Expecting ',' delimiter" at the second-to-last character.
+
+        Strategy: count unbalanced '[' vs ']'. If unbalanced by N, insert N
+        ']' immediately before the final N closing '}' characters.
+
+        Common case (N=1, ends with '}}'):
+          ...,"finish_reason":"stop"}}
+          →  ...,"finish_reason":"stop"}]}   ✓
+
+        Returns repaired string, or None if brackets are already balanced or
+        the raw doesn't end with '}' (insertion point ambiguous).
+        """
+        d_brack = raw.count('[') - raw.count(']')
+        if d_brack <= 0:
+            return None  # already balanced or over-closed
+
+        raw_s = raw.rstrip()
+        if not raw_s.endswith('}'):
+            return None
+
+        # Insert d_brack ']' chars before the final d_brack '}' chars.
+        tail = raw_s[-d_brack:]
+        prefix = raw_s[:-d_brack]
+        candidate = prefix + (']' * d_brack) + tail
+        try:
+            json.loads(candidate)
+            return candidate
+        except json.JSONDecodeError:
+            pass
+
+        # Fallback: try inserting at various offsets from end
+        for offset in range(1, min(30, len(raw_s))):
+            attempt = raw_s[:-offset] + (']' * d_brack) + raw_s[-offset:]
+            try:
+                json.loads(attempt)
+                return attempt
+            except json.JSONDecodeError:
+                pass
+
+        return None
+
+    @staticmethod
     def _repair_unescaped_quotes(raw: str) -> "str | None":
         """
         Fallback repair untuk kasus paling umum: model menulis quote literal (")
@@ -695,6 +743,247 @@ class BaseAIChatScraper(ABC):
             raw[:content_start] + repaired_inner + raw[end_idx:]
         )
         return repaired
+
+    @staticmethod
+    def _repair_content_field(raw: str) -> "str | None":
+        """
+        Robust repair untuk JSON di mana string value 'content' mengandung
+        karakter yang merusak parsing: unescaped quotes, literal newlines, dll.
+
+        Strategi:
+        1. Temukan '"content":"' marker.
+        2. Cari posisi tail envelope yang valid (rfind dari belakang) sebagai
+           batas akhir isi content.
+        3. Escape seluruh inner content (backslash, quote, newline, dll).
+        4. Rebuild JSON; jika masih unbalanced brace/bracket, tambahkan
+           penutup yang hilang secara otomatis.
+        5. Coba beberapa tail_pattern sebelum menyerah.
+
+        Truncation fallback (Stage A + B):
+        - Stage A (near-truncation): scan mundur hingga 100 char dari akhir,
+          cari '"' yang diikuti '}', ',' atau ']' — ini kemungkinan penutup
+          string content yang asli; sisa setelahnya adalah partial JSON tail.
+        - Stage B (hard truncation): JSON terpotong total oleh virtual scroll
+          sebelum penutup apapun muncul. Escape seluruh sisa string sebagai
+          content dan paksa tutup envelope.
+
+        Returns string JSON yang sudah diperbaiki, atau None jika tidak
+        applicable (tidak ada 'content' key, atau semua strategi gagal).
+        """
+        marker = '"content":"'
+        start_idx = raw.find(marker)
+        if start_idx == -1:
+            return None
+        content_start = start_idx + len(marker)
+        raw_s = raw.rstrip()
+
+        tail_patterns = [
+            '","finish_reason":"stop"}]}',
+            '","finish_reason":"stop"}}',
+            '"},"finish_reason":"stop"}]}',
+            '"},"finish_reason":"stop"}}',   # DeepSeek's common }} variant
+            '"}]}',
+            '"}}',
+            '"}]',
+            '"}}]',
+        ]
+
+        def _balance(s: str) -> str:
+            """Insert missing closing braces/brackets at end of string."""
+            d_brace = d_brack = 0
+            for ch in s:
+                if ch == '{': d_brace += 1
+                elif ch == '}': d_brace -= 1
+                elif ch == '[': d_brack += 1
+                elif ch == ']': d_brack -= 1
+            if d_brace == 0 and d_brack == 0:
+                return s
+            suffix = ('}' * d_brace if d_brace > 0 else '') + (']' * d_brack if d_brack > 0 else '')
+            return s.rstrip() + suffix
+
+        def _esc(s: str) -> str:
+            return (
+                s.replace("\\", "\\\\").replace('"', '\\"')
+                 .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+            )
+
+        def _try_with_content(prefix: str, content_val: str) -> "str | None":
+            """Escape content_val and try to build a parseable JSON envelope."""
+            e = _esc(content_val)
+            for ctail in [
+                '","finish_reason":"stop"}]}',
+                '"},"finish_reason":"stop"}]}',
+                '"}}',
+            ]:
+                cand = prefix + e + ctail
+                try:
+                    json.loads(cand)
+                    return cand
+                except json.JSONDecodeError:
+                    pass
+                bal = _balance(cand)
+                if bal != cand:
+                    try:
+                        json.loads(bal)
+                        return bal
+                    except json.JSONDecodeError:
+                        pass
+            return None
+
+        # ── Pass 1: known tail patterns (rfind) ─────────────────────────── #
+        for raw_tail in tail_patterns:
+            idx = raw_s.rfind(raw_tail)
+            if idx <= content_start:
+                continue
+            inner = raw_s[content_start:idx]
+            cand = raw_s[:content_start] + _esc(inner) + raw_tail
+            try:
+                json.loads(cand)
+                return cand
+            except json.JSONDecodeError:
+                pass
+            bal = _balance(cand)
+            if bal != cand:
+                try:
+                    json.loads(bal)
+                    return bal
+                except json.JSONDecodeError:
+                    pass
+            for insertion in ['}', '}}', '}}}']:
+                for pos_marker in ['}]}', '}]', ']}', ']']:
+                    last_pos = cand.rfind(pos_marker)
+                    if last_pos > 0:
+                        attempt = cand[:last_pos] + insertion + cand[last_pos:]
+                        try:
+                            json.loads(attempt)
+                            return attempt
+                        except json.JSONDecodeError:
+                            pass
+
+        # ── Pass 2: Truncation fallback ──────────────────────────────────── #
+        prefix = raw_s[:content_start]
+        inner_raw = raw_s[content_start:]
+
+        # Stage A — near-truncation: look for '"' followed by '}', ',' or ']'
+        # in the last 100 chars, scanning FORWARD (earliest occurrence wins).
+        # Scanning forward ensures we find the content's ACTUAL closing '"'
+        # before any JSON envelope markers deeper in the tail (e.g. "stop"}}).
+        scan_start = max(0, len(inner_raw) - 100)
+        for pos in range(scan_start, len(inner_raw) - 1):
+            if inner_raw[pos] == '"' and inner_raw[pos + 1] in ('}', ',', ']'):
+                result = _try_with_content(prefix, inner_raw[:pos])
+                if result:
+                    return result
+
+        # Stage B — hard truncation: JSON cut off before any closing delimiter.
+        # Treat the entire remaining string as content (truncated mid-sentence).
+        trimmed = inner_raw
+        if trimmed.endswith('"') and (len(trimmed) < 2 or trimmed[-2] != '\\'):
+            trimmed = trimmed[:-1]
+        result = _try_with_content(prefix, trimmed)
+        if result:
+            return result
+
+        return None
+
+    @staticmethod
+    def _repair_by_regex(raw: str) -> "str | None":
+        """
+        Last-resort repair: extract the 'content' string value via regex and
+        reconstruct a guaranteed-valid JSON envelope from a Python dict.
+
+        Bypasses ALL JSON structural issues:
+        - Virtual-scroll truncation (JSON cut off mid-sentence or mid-field)
+        - Unescaped quotes, newlines, or backslashes inside content
+        - Wrong brace placement (finish_reason inside vs outside message)
+        - Any other malformed envelope around a parseable content string
+
+        Only applies to success-style responses (must have a '"content"' key).
+        Tool-calls responses (no 'content') correctly return None.
+
+        Returns a compact, single-line, guaranteed-valid JSON string, or None
+        if no '"content"' key is found in raw.
+        """
+        import re as _re
+        # Capture everything after "content":" until first unescaped " or EOF.
+        # DOTALL handles literal newlines inside the value.
+        m = _re.search(r'"content"\s*:\s*"((?:[^"\\]|\\.)*)', raw, _re.DOTALL)
+        if not m:
+            return None
+
+        raw_content = m.group(1)  # with JSON escape sequences intact
+
+        # Decode JSON escape sequences → real Python string
+        try:
+            content = json.loads('"' + raw_content + '"')
+        except (json.JSONDecodeError, ValueError):
+            # Truncated mid-escape-sequence: strip trailing backslash and retry
+            content = json.loads('"' + raw_content.rstrip('\\') + '"') if raw_content.rstrip('\\') != raw_content else raw_content.rstrip('\\')
+
+        # Reconstruct a proper, guaranteed-valid JSON envelope
+        return json.dumps(
+            {
+                "status": "success",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop",
+                }],
+            },
+            ensure_ascii=False,
+            separators=(',', ':'),
+        )
+
+    @staticmethod
+    def _fix_invalid_backslashes(raw: str) -> "str | None":
+        """
+        Scan JSON string char-by-char; inside string literals, replace any
+        backslash sequence that isn't a valid JSON escape (\\", \\\\, \\/, \\b,
+        \\f, \\n, \\r, \\t, \\uXXXX) with a doubled backslash.
+
+        Handles Windows paths like "C:\\Users\\..." that DeepSeek writes as
+        "C:\\Users\\..." with unescaped backslashes, causing 'Invalid \\escape'
+        JSON parse errors.
+
+        Returns the repaired string, or None if nothing changed (no-op on
+        already-valid JSON).
+        """
+        VALID_AFTER_BS = frozenset(['"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u'])
+        out: list[str] = []
+        in_str = False
+        changed = False
+        i = 0
+        n = len(raw)
+        while i < n:
+            c = raw[i]
+            if not in_str:
+                out.append(c)
+                if c == '"':
+                    in_str = True
+                i += 1
+            else:
+                if c == '\\':
+                    nxt = raw[i + 1] if i + 1 < n else ''
+                    if nxt in VALID_AFTER_BS:
+                        # Valid escape (\\", \\\\, \\/, \\b, \\f, \\n, \\r, \\t, \\uXXXX)
+                        # emit both chars unchanged; \uXXXX hex digits follow as normal chars
+                        out.append(c)
+                        out.append(nxt)
+                        i += 2
+                    else:
+                        # Invalid escape — double the backslash; next char processed normally
+                        out.append('\\\\')
+                        changed = True
+                        i += 1
+                elif c == '"':
+                    # Unescaped quote → closing delimiter of this string literal
+                    out.append(c)
+                    in_str = False
+                    i += 1
+                else:
+                    out.append(c)
+                    i += 1
+        return ''.join(out) if changed else None
 
     @staticmethod
     def _repair_tool_calls_arguments(raw: str) -> "str | None":
