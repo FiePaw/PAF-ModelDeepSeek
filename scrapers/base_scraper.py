@@ -399,21 +399,29 @@ class BaseAIChatScraper(ABC):
         """
         Dump diagnostic info about the current DOM state for debugging
         response detection failures.
+
+        Selector lists are read dynamically from ``_virtual_list_selectors()``
+        and ``_response_selectors()`` so the diagnostic always reflects the
+        selectors that are ACTUALLY used at runtime, not a separate hardcoded
+        list that can drift out of sync.
         """
         if self.page is None:
             return
         log.info("[DIAG] === DOM DIAGNOSTIC START === url=%s", self.page.url)
-        # Check all candidate selectors
-        diag_selectors = [
-            ".ds-virtual-list-visible-items",
-            ".ds-virtual-list",
-            "div.ds-markdown",
-            "div[class*='ds-markdown']",
-            "div[class*='markdown']",
-            ".ds-virtual-list-visible-items div.ds-markdown",
-            ".ds-virtual-list-visible-items div[class*='ds-markdown']",
-            ".ds-virtual-list-visible-items > *",
-        ]
+
+        # Build selector list from the live sources of truth:
+        #   - virtual_list selectors (what wait_for_response actually uses)
+        #   - response_selectors (what is visible at call-sites; shown for comparison)
+        # De-duplicate while preserving order.
+        _seen: set[str] = set()
+        diag_selectors: list[str] = []
+        for _sel in list(self._virtual_list_selectors()) + list(self._response_selectors()):
+            if _sel not in _seen:
+                _seen.add(_sel)
+                diag_selectors.append(_sel)
+        log.info("[DIAG] virtual_list_selectors: %s", self._virtual_list_selectors())
+        log.info("[DIAG] response_selectors:      %s", self._response_selectors())
+
         for sel in diag_selectors:
             try:
                 count = await self.page.locator(sel).count()
@@ -458,13 +466,13 @@ class BaseAIChatScraper(ABC):
 
     async def wait_for_response(
         self,
-        response_selectors: list[str],
         timeout: float,
-        stability_secs: float,
+        stability_secs: float,  # noqa: ARG002 – accepted for backward compat, may be used later
         stability_polls: int,
         poll_interval: float,
-        initial_response_count: dict[str, int] | int = 0,
+        initial_response_count: dict[str, int] | int = 0,  # noqa: ARG002 – backward compat
         pre_send_text: str = "",
+        **_deprecated_kwargs,          # absorbs response_selectors= from old call-sites
     ) -> str:
         """
         Wait until the AI response stops changing.
@@ -492,8 +500,11 @@ class BaseAIChatScraper(ABC):
           • ``:last-of-type`` baseline mismatch
           • DOM restructuring between exchanges
 
-        ``initial_response_count`` is accepted for backward compatibility but
-        is no longer used in the detection loop.
+        ``initial_response_count`` and ``response_selectors`` are accepted
+        for backward compatibility via **kwargs but are no longer used in the
+        detection loop.  Pass ``response_selectors`` as a keyword argument at
+        call-sites; it is silently ignored here so old call-sites keep working
+        until they are cleaned up.
         """
         deadline = time.monotonic() + timeout
         last_text = ""
@@ -560,8 +571,8 @@ class BaseAIChatScraper(ABC):
 
     async def _read_latest_response(
         self,
-        selectors: list[str],
-        baselines: dict[str, int] | None = None,
+        selectors: list[str],  # noqa: ARG002 – backward compat, not used
+        baselines: dict[str, int] | None = None,  # noqa: ARG002 – backward compat
     ) -> str:
         """
         Return the text of the latest assistant message.

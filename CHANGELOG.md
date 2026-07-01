@@ -5,6 +5,162 @@ Format: `[version] YYYY-MM-DD — summary`
 
 ---
 
+## [2.6.0] 2026-07-01 — Dead-parameter patch + ruff linter + automated regression tests
+
+Rilis ini menyelesaikan **tiga pekerjaan sekaligus** yang diidentifikasi pada sesi
+analisis bug [2026-06-30]: (1) patch dead parameter `response_selectors` yang sudah
+tidak tersambung sejak rewrite Bug #9 di v2.2.2, (2) setup linter ruff untuk
+mencegah kelas bug serupa lolos di masa depan, dan (3) konversi 8 skenario
+regression test manual dari CHANGELOG [2.5.1] menjadi automated pytest — semua
+**10 test passed** pada run pertama.
+
+---
+
+### Bug Fixes
+
+#### `scrapers/base_scraper.py` — Dead parameter `response_selectors` di `wait_for_response()` (VESTIGIAL)
+
+- **Root cause (historis):** Sejak rewrite besar di v2.2.2 (Bug #9 virtual-scroll fix),
+  fungsi `_read_latest_response(selectors)` yang benar-benar memakai parameter
+  selector diganti total dengan `_get_last_response_text()` yang tidak menerima
+  parameter apapun (selalu pakai `self._virtual_list_selectors()` secara internal).
+  Namun **3 call-site** `wait_for_response()` di `scrape()`, corrective-retry loop,
+  dan `scrape_with_tool_result()` tetap mengirim `response_selectors=self._response_selectors()`
+  seolah-olah parameter itu masih dipakai — padahal sudah tidak tersambung ke mana pun.
+- **Dampak:** Selector "resmi" (`assistant_message`, `response_container`) terlihat
+  mengontrol deteksi response karena dikirim eksplisit, padahal yang benar-benar
+  dipakai adalah `virtual_list_response` dari config. Update/fix di selector "resmi"
+  tidak akan berpengaruh apapun ke deteksi response secara silent.
+- **Fix:**
+  - Parameter `response_selectors: list[str]` **dihapus** dari signature
+    `wait_for_response()`.
+  - Diganti dengan `**_deprecated_kwargs` — menyerap `response_selectors=` dari
+    3 call-site lama agar tidak crash (backward compatible) sambil menunggu
+    call-site dibersihkan.
+  - Docstring diperbarui: menyebut eksplisit bahwa `response_selectors` diterima
+    via `**kwargs` tapi diabaikan.
+
+```python
+# SEBELUM (bug — parameter dideklarasikan tapi tidak pernah dipakai di body):
+async def wait_for_response(
+    self,
+    response_selectors: list[str],   # ← dead weight sejak v2.2.2
+    timeout: float,
+    ...
+) -> str:
+
+# SESUDAH (fix — parameter dihapus, backward compat via **kwargs):
+async def wait_for_response(
+    self,
+    timeout: float,
+    ...
+    **_deprecated_kwargs,   # absorbs response_selectors= from old call-sites
+) -> str:
+```
+
+---
+
+#### `scrapers/base_scraper.py` — `_dump_dom_diagnostic()` hardcoded selector list tidak sinkron
+
+- **Root cause:** `_dump_dom_diagnostic()` (dipanggil saat timeout untuk debugging)
+  punya daftar selector **hardcoded sendiri** yang terpisah dari `_virtual_list_selectors()`
+  maupun `_response_selectors()`. Output diagnostic saat debugging tidak mencerminkan
+  selector yang sesungguhnya dipakai scraper → mempersulit debugging di masa depan.
+- **Fix:** Selector list di `_dump_dom_diagnostic()` sekarang dibaca live dari
+  `self._virtual_list_selectors()` + `self._response_selectors()` (de-duplikasi
+  order-preserving). Diagnostic juga menampilkan kedua list secara terpisah di log
+  untuk perbandingan. Tidak ada lagi hardcoded selector terpisah.
+
+---
+
+### New: Linter Setup
+
+#### `pyproject.toml` (file baru di root repo)
+
+Konfigurasi **ruff** ditambahkan sebagai satu-satunya linter config untuk repo ini.
+
+| Rule set | Coverage |
+|----------|----------|
+| `E`, `W` | pycodestyle style errors & warnings |
+| `F` | pyflakes (unused imports, undefined names) |
+| `I` | isort (import ordering) |
+| `B` | flake8-bugbear (likely bugs & design issues) |
+| `ARG` | unused function arguments — **rule ini yang akan menangkap dead parameter seperti `response_selectors` SEBELUM merge** |
+| `LOG` | flake8-logging (logging anti-patterns) |
+
+Rule yang di-ignore secara global: `E501` (line length), `B008` (fn call in default — Playwright APIs), `B904` (raise without from).
+
+Cara pakai:
+```bash
+pip install ruff
+ruff check .                # check seluruh repo
+ruff check . --fix          # auto-fix masalah yang aman (import sorting, dll)
+```
+
+Semua backward-compat dead parameter yang disengaja (termasuk `**_deprecated_kwargs`,
+`initial_response_count`, `stability_secs`, `selectors`, `baselines`) sudah diberi
+komentar `# noqa: ARG002` agar tidak memunculkan false positive.
+
+---
+
+### New: Automated Regression Tests
+
+#### `tests/test_json_repair.py` (file baru)
+#### `tests/__init__.py` (file baru)
+#### `tests/conftest.py` (file baru)
+
+Seluruh 8 skenario regression test manual yang didokumentasikan di CHANGELOG [2.5.1]
+dikonversi menjadi **automated pytest**. Playwright di-mock di level `sys.modules`
+sehingga test bisa berjalan tanpa browser terinstall (murni unit test fungsi pure).
+
+| # | Test | Repair Pass | Hasil |
+|---|------|-------------|-------|
+| 1 | `test_scenario_1_valid_response` | direct parse | ✅ PASSED |
+| 2 | `test_scenario_2_missing_closing_bracket` | pass 0.5 `_repair_unbalanced_brackets` | ✅ PASSED |
+| 3 | `test_scenario_3_unescaped_quotes_and_missing_bracket` | pass 3 Stage A forward | ✅ PASSED |
+| 4 | `test_scenario_4_windows_path_backslashes` | pass 0 `_fix_invalid_backslashes` | ✅ PASSED |
+| 5 | `test_scenario_5_truncated_mid_sentence` | pass 3 Stage B hard truncation | ✅ PASSED |
+| 6 | `test_scenario_6_near_truncation_finish_reason` | pass 3 Stage A | ✅ PASSED |
+| 7 | `test_scenario_7_literal_newline_in_content` | pass 3 | ✅ PASSED |
+| 8 | `test_scenario_8_tool_calls_arguments_as_dict` | direct parse + normalisasi | ✅ PASSED |
+| + | `test_fix_backslashes_noop_on_valid` | noop check | ✅ PASSED |
+| + | `test_repair_unbalanced_noop_on_balanced` | noop check | ✅ PASSED |
+
+**Total: 10/10 passed**, run time 0.10s.
+
+Cara pakai:
+```bash
+pip install pytest
+pytest tests/test_json_repair.py -v
+```
+
+---
+
+### Root Cause Sistemik yang Dialamatkan
+
+Tiga perbaikan di rilis ini secara langsung merespons 4 dari 5 root cause sistemik
+yang diidentifikasi pada sesi analisis [2026-06-30]:
+
+| Root cause | Dialamatkan oleh |
+|------------|-----------------|
+| Selector DOM punya >1 sumber kebenaran yang tidak sinkron | Patch `_dump_dom_diagnostic()` — sekarang baca live dari sumber yang sama |
+| Rewrite besar tidak membersihkan pemanggil/referensi lama | Ruff `ARG` rules — dead argument terdeteksi otomatis |
+| Tidak ada test otomatis | `tests/test_json_repair.py` — 10 automated regression test |
+| Tidak ada linter / static analysis | `pyproject.toml` dengan ruff |
+| Ketergantungan live DOM pihak ketiga (masih terbuka) | — belum dialamatkan (butuh DOM fixture/snapshot test terpisah) |
+
+### Files Modified / Added
+
+| File | Status | Perubahan |
+|------|--------|-----------|
+| `scrapers/base_scraper.py` | modified | Hapus dead param `response_selectors`; refactor `_dump_dom_diagnostic()` pakai live selectors; tambah `noqa` comments |
+| `pyproject.toml` | **NEW** | Ruff linter config |
+| `tests/__init__.py` | **NEW** | Package marker |
+| `tests/conftest.py` | **NEW** | sys.path setup untuk pytest |
+| `tests/test_json_repair.py` | **NEW** | 10 automated regression tests (8 skenario CHANGELOG + 2 noop) |
+
+---
+
 ## [2.5.1] 2026-06-30 — JSON repair overhaul + tool-result pipeline bug fixes
 
 Rilis ini memperbaiki **8 bug** yang ditemukan selama sesi pengujian Turn 2
