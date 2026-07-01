@@ -392,13 +392,13 @@ DEEPSEEK_CONFIG: dict = {
         # the response text to be unchanged across two consecutive reads.
         "stability_polls": 2,        # consecutive stable polls required
         "poll_interval": 0.5,
-        # OPTIMISATION: small UI settle pause between actions, halved (0.4 -> 0.2).
-        # Called ~4-5x per process -> ~1s saved.
-        "between_actions": 0.2,
+        # OPTIMISATION: small UI settle pause between actions, halved again (0.2 -> 0.1).
+        # Called ~4-5x per process -> ~0.5s saved vs previous 0.2 value.
+        "between_actions": 0.1,
         # OPTIMISATION: shared budget cap for locating a UI element (mode pills,
         # tool toggles, etc.). Used by _find_first so a missing element no longer
         # burns a full multi-second timeout per selector candidate.
-        "element_find": 1500,
+        "element_find": 1000,
     },
 }
 
@@ -429,7 +429,10 @@ AUTH_CONFIG: dict = {
     # Seconds to wait for the post-login redirect to the chat UI.
     "login_wait": 60,
     # Settle time after a successful login before using the page.
-    "post_login_settle": 3.0,
+    # OPTIMISATION: reduced from 3.0 -> 0.5. The chat input is already confirmed
+    # present (via _find_first) before this sleep runs, so a 3s blind wait is
+    # unnecessary. 0.5s gives the SPA a small buffer without blocking the flow.
+    "post_login_settle": 0.5,
     # If a captcha/slider appears, password login cannot complete headlessly.
     # When True the scraper fails loudly so you re-run once with --no-headless
     # to solve it (the persistent profile remembers it afterwards).
@@ -477,7 +480,10 @@ ROTATION_CONFIG: dict = {
         "out of memory",
     ],
     "max_retries_per_account": 2,
-    "retry_delay": 3.0,
+    # OPTIMISATION: reduced from 3.0 -> 1.0. Shorter retry pause while still
+    # giving the server a moment to recover. Called up to 5x per flow so the
+    # old value could add up to 15s of dead time on a bad run.
+    "retry_delay": 1.0,
     "rotation_delay": 5.0,
     "max_browser_restarts": 3,
     "browser_restart_delay": 4.0,
